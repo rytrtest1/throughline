@@ -1,6 +1,6 @@
 // throughline service worker — makes the app work offline after first load.
 // Bump CACHE when you change index.html or assets so phones pick up the update.
-const CACHE = "throughline-v7";
+const CACHE = "throughline-v8";
 const CORE = [
   "./",
   "./index.html",

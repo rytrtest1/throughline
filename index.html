@@ -95,12 +95,28 @@ const SEED = [
 ];
 
 // ---------- engine ----------
-function defaultPlace() {
-  const d = new Date(); const day = d.getDay(); const h = d.getHours();
-  const evening = (day === 4 || day === 5 || day === 6) && h >= 20; // Thu/Fri/Sat night
-  const morning = (day === 5 || day === 6 || day === 0) && h < 8;   // tail into Fri/Sat/Sun morning
-  return evening || morning ? "work" : "home";
+// Work happens on fixed night shifts (20:00 → 08:00 the next morning):
+//   • every Thursday, Friday, Saturday night
+//   • every other Sunday night — anchored to Sun 7 Jun 2026 being a work night
+// Outside those windows the place is always "home". No manual toggle: the app
+// just knows where you are from the clock.
+const WORK_SUNDAY_ANCHOR = new Date(2026, 5, 7); // Sun 7 Jun 2026 = a work night
+function isWorkShift(d = new Date()) {
+  const h = d.getHours();
+  let startDay, startDate; // the calendar day the shift *began* (its 20:00)
+  if (h >= 20) { startDay = d.getDay(); startDate = new Date(d); }
+  else if (h < 8) { startDay = (d.getDay() + 6) % 7; startDate = new Date(d); startDate.setDate(startDate.getDate() - 1); }
+  else return false; // 08:00–20:00 is never a shift
+  if (startDay === 4 || startDay === 5 || startDay === 6) return true; // Thu/Fri/Sat
+  if (startDay === 0) { // Sunday — alternate weeks
+    const a = new Date(WORK_SUNDAY_ANCHOR); a.setHours(0, 0, 0, 0);
+    const s = new Date(startDate); s.setHours(0, 0, 0, 0);
+    const weeks = Math.round((s - a) / (7 * 86400000));
+    return ((weeks % 2) + 2) % 2 === 0;
+  }
+  return false;
 }
+const computePlace = (d = new Date()) => (isWorkShift(d) ? "work" : "home");
 // Skips (type:"skip") are recorded for reflection but must NOT count as done,
 // or the engine would think you did what you just declined. undefined = done.
 const isDone = (e) => e.type !== "skip";
@@ -201,13 +217,17 @@ const css = `
 .chip.on{color:${C.bg};background:${C.bone};border-color:${C.bone}}
 .fade{opacity:0;transform:translateY(8px);animation:fu .5s cubic-bezier(.2,.7,.2,1) forwards}
 @keyframes fu{to{opacity:1;transform:none}}
+.navarr{font-family:var(--mono);font-size:20px;line-height:1;background:none;border:none;color:${C.line};cursor:pointer;padding:6px 10px;transition:color .25s}
+.navarr:hover{color:${C.mut}}
+.breathe{animation:breathe 3.6s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:.4}50%{opacity:.95}}
 .link{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:${C.faint};background:none;border:none;cursor:pointer;transition:color .2s}
 .link:hover{color:${C.mut}}
 textarea.in{resize:vertical}
 input[type=range].sl{-webkit-appearance:none;appearance:none;height:2px;background:${C.line};outline:none;width:100%;margin:0}
 input[type=range].sl::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:${C.bone};cursor:pointer}
 input[type=range].sl::-moz-range-thumb{width:16px;height:16px;border:none;border-radius:50%;background:${C.bone};cursor:pointer}
-@media (prefers-reduced-motion:reduce){.fade{animation:none;opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.fade{animation:none;opacity:1;transform:none}.breathe{animation:none;opacity:.7}}
 `;
 
 function Throughline() {
@@ -218,7 +238,7 @@ function Throughline() {
   const loaded = useRef(false);
 
   // now-flow
-  const [place, setPlace] = useState(defaultPlace());
+  const [place, setPlace] = useState(computePlace());
   const [stage, setStage] = useState("entry"); // entry | proposal | running | empty | done
   const [current, setCurrent] = useState(null);
   const [lastId, setLastId] = useState(null);
@@ -266,7 +286,8 @@ function Throughline() {
 
   // ----- now-flow actions -----
   const propose = (logUse = log, actsUse = activities, relax = false, avoidId = null) => {
-    const p = pick(actsUse, logUse, place, null, relax, avoidId);
+    const pl = computePlace(); setPlace(pl); // place is read from the clock, not chosen
+    const p = pick(actsUse, logUse, pl, null, relax, avoidId);
     setShowWhy(false);
     setRunning(false); setElapsedMs(0);
     if (!p) { setCurrent(null); setStage("empty"); }
@@ -278,6 +299,22 @@ function Throughline() {
   // few seconds. The minimum viable move is a sliver of the line, not a clean exit.
   const swap = () => propose(log, activities, false, current ? current.activity.id : null);
   const resetFlow = () => { setStage("entry"); setCurrent(null); setShowWhy(false); setRunning(false); setElapsedMs(0); };
+
+  // section navigation — no tab bar; swipe left/right or tap the faint edge arrows.
+  const TABS = ["now", "activities", "progress"];
+  const go = (dir) => {
+    const i = TABS.indexOf(tab);
+    const ni = Math.min(TABS.length - 1, Math.max(0, i + dir));
+    if (ni === i) return;
+    const t = TABS[ni]; setTab(t); if (t === "now") resetFlow();
+  };
+  const touchRef = useRef(null);
+  const onTouchStart = (e) => { const t = e.touches[0]; touchRef.current = { x: t.clientX, y: t.clientY }; };
+  const onTouchEnd = (e) => {
+    const s = touchRef.current; touchRef.current = null; if (!s) return;
+    const t = e.changedTouches[0]; const dx = t.clientX - s.x, dy = t.clientY - s.y;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+  };
 
   // tap to begin acting — the line starts filling from the centre.
   const begin = () => { setStartedAt(Date.now()); setElapsedMs(0); setRunning(true); setStage("running"); };
@@ -358,14 +395,6 @@ function Throughline() {
     <div className="tl"><style dangerouslySetInnerHTML={{ __html: css }} /><div className="grain" /><div className="wrap"><span className="lab">loading…</span></div></div>
   );
 
-  const PlaceToggle = () => (
-    <div style={{ display: "flex", gap: 6 }}>
-      {["home", "work", "out"].map((p) => (
-        <button key={p} className={`seg ${place === p ? "on" : ""}`} onClick={() => setPlace(p)}>{p}</button>
-      ))}
-    </div>
-  );
-
   // live line geometry — fraction of the action's estimated time that has elapsed.
   // full (=1) means the line reaches the margins; >1 means you've gone beyond.
   const fullMs = Math.max(1, (current?.action?.min || 10) * 60000);
@@ -375,37 +404,23 @@ function Throughline() {
     <div className="tl">
       <style dangerouslySetInnerHTML={{ __html: css }} />
       <div className="grain" />
-      <div className="wrap">
+      <div className="wrap" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
 
-        <div className="fade" style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-          <span className="mono" style={{ fontSize: 12, letterSpacing: ".3em", textTransform: "uppercase", color: C.mut }}>throughline</span>
-          <span className="lab">{fmtLong(todayKey())}</span>
+        {/* the only chrome: two faint arrows. swipe left/right works too. */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", height: 22 }}>
+          <button className="navarr" style={{ visibility: tab === TABS[0] ? "hidden" : "visible" }} onClick={() => go(-1)} aria-label="previous">‹</button>
+          <button className="navarr" style={{ visibility: tab === TABS[TABS.length - 1] ? "hidden" : "visible" }} onClick={() => go(1)} aria-label="next">›</button>
         </div>
-
-        <div className="fade" style={{ display: "flex", gap: 22, marginTop: 20 }}>
-          {["now", "activities", "progress"].map((t) => (
-            <button key={t} className={`tab ${tab === t ? "on" : ""}`} onClick={() => { setTab(t); if (t === "now") resetFlow(); }}>{t}<span className="u" /></button>
-          ))}
-        </div>
-        <hr className="rule" style={{ marginTop: 14 }} />
 
         {/* =================== NOW =================== */}
         {tab === "now" && (
-          <div style={{ display: "flex", flexDirection: "column", minHeight: "calc(100vh - 220px)" }}>
-
-            <div className="fade" style={{ display: "flex", justifyContent: "center", marginTop: 22, visibility: stage === "running" ? "hidden" : "visible" }}>
-              <PlaceToggle />
-            </div>
+          <div style={{ display: "flex", flexDirection: "column", minHeight: "calc(100vh - 150px)" }}>
 
             {/* the stage: instruction above, the living line as hero, controls below — vertically centered */}
             <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", paddingBottom: 30 }}>
 
               {/* ---------- above the line: the instruction ---------- */}
               <div style={{ minHeight: 130, display: "flex", flexDirection: "column", justifyContent: "flex-end", textAlign: "center", marginBottom: 30 }}>
-
-                {stage === "entry" && (
-                  <div className="fade lab" style={{ alignSelf: "center", opacity: .45 }}>one thing</div>
-                )}
 
                 {(stage === "proposal" || stage === "running" || stage === "done") && current && (
                   <div className="fade">
@@ -435,14 +450,19 @@ function Throughline() {
               {(() => {
                 const over = frac > 1;
                 const widthPct = Math.min(frac, 1.85) * 100;
-                const tappable = stage === "proposal" || stage === "running";
+                // the line carries the whole loop: tap to ask, tap to begin, tap to end, tap for the next.
+                const onTap =
+                  stage === "entry" ? start :
+                  stage === "proposal" ? begin :
+                  stage === "running" ? finish :
+                  stage === "done" ? start : undefined;
                 return (
-                  <div className="fade" onClick={tappable ? (stage === "proposal" ? begin : finish) : undefined}
-                    style={{ position: "relative", height: 14, marginLeft: -20, marginRight: -20,
+                  <div onClick={onTap}
+                    style={{ position: "relative", height: 40, marginLeft: -20, marginRight: -20,
                       display: "flex", justifyContent: "center", alignItems: "center",
-                      overflow: "visible", cursor: tappable ? "pointer" : "default" }}>
+                      overflow: "visible", cursor: onTap ? "pointer" : "default" }}>
                     {/* hollow track */}
-                    <div style={{ position: "absolute", left: 0, right: 0, top: "50%", transform: "translateY(-50%)", height: 2, background: C.soft }} />
+                    <div className={stage === "entry" ? "breathe" : ""} style={{ position: "absolute", left: 0, right: 0, top: "50%", transform: "translateY(-50%)", height: 2, background: stage === "entry" ? C.bone : C.soft }} />
                     {/* centre fill — grows symmetrically from the middle */}
                     {frac > 0 && (
                       <div style={{ position: "relative", flexShrink: 0, height: over ? 8 : 6, width: `${widthPct}%`,
@@ -457,13 +477,11 @@ function Throughline() {
               {/* ---------- below the line: controls ---------- */}
               <div style={{ minHeight: 130, marginTop: 30, textAlign: "center" }}>
 
-                {stage === "entry" && (
-                  <button className="fade link" onClick={start} style={{ fontSize: 11 }}>give me one thing →</button>
-                )}
+                {/* entry: nothing. just the breathing line above. */}
 
                 {stage === "proposal" && current && (
                   <div className="fade">
-                    <button className="primary" style={{ maxWidth: 280, margin: "0 auto", display: "block" }} onClick={begin}>start</button>
+                    <div className="mono" style={{ fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase", color: C.faint }}>tap the line to begin</div>
                     <div style={{ display: "flex", justifyContent: "center", gap: 28, marginTop: 18 }}>
                       <button className="ghost" onClick={() => setShowWhy((s) => !s)}>{showWhy ? "hide" : "why this?"}</button>
                       <button className="ghost" onClick={swap}>something else</button>
@@ -472,11 +490,8 @@ function Throughline() {
                 )}
 
                 {stage === "running" && current && (
-                  <div className="fade">
-                    <button className="primary" style={{ maxWidth: 280, margin: "0 auto", display: "block" }} onClick={finish}>done</button>
-                    <div className="mono" style={{ fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase", color: C.faint, marginTop: 18 }}>
-                      {frac > 1 ? "beyond — keep going" : "a few seconds counts"}
-                    </div>
+                  <div className="fade mono" style={{ fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase", color: C.faint }}>
+                    {frac > 1 ? "beyond — keep going · tap to stop" : "tap the line when you stop"}
                   </div>
                 )}
 
@@ -489,7 +504,7 @@ function Throughline() {
 
                 {stage === "done" && (
                   <div className="fade">
-                    <button className="primary" style={{ maxWidth: 280, margin: "0 auto", display: "block" }} onClick={start}>one more</button>
+                    <div className="mono" style={{ fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase", color: C.faint }}>logged · tap the line for another</div>
                     <button className="link" style={{ marginTop: 16 }} onClick={resetFlow}>that's it for now</button>
                   </div>
                 )}
@@ -513,14 +528,15 @@ function Throughline() {
         {/* =================== PROGRESS =================== */}
         {tab === "progress" && <Progress activities={activities} log={log} quickLog={quickLog} delLog={delLog} />}
 
-        {/* =================== FOOTER — save / load, bottom of page =================== */}
-        <div className="fade" style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 22, marginTop: 56, paddingTop: 18, borderTop: `1px solid ${C.line}` }}>
-          <button className="link" onClick={shareBackup}>save</button>
-          <label className="link" style={{ cursor: "pointer" }}>load
-            <input type="file" accept="application/json,.json" onChange={onFile} style={{ display: "none" }} />
-          </label>
-          <button className="link" onClick={copy}>copy</button>
-          <button className="link" style={{ color: C.line }} onClick={resetAll}>reset</button>
+        {/* =================== FOOTER — save / load centered, reset tucked further below =================== */}
+        <div className="fade" style={{ marginTop: 56, paddingTop: 18, borderTop: `1px solid ${C.line}`, textAlign: "center" }}>
+          <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 26 }}>
+            <button className="link" onClick={shareBackup}>save</button>
+            <label className="link" style={{ cursor: "pointer" }}>load
+              <input type="file" accept="application/json,.json" onChange={onFile} style={{ display: "none" }} />
+            </label>
+          </div>
+          <button className="link" style={{ color: C.line, marginTop: 22 }} onClick={resetAll}>reset</button>
         </div>
 
         {msg && (
