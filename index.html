@@ -12,7 +12,7 @@
 <style>html,body{margin:0;background:#0a0a0b}</style>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -71,12 +71,18 @@ const DOMAINS = [
 const DKEYS = DOMAINS.map((d) => d.key);
 const dColor = (k) => (DOMAINS.find((d) => d.key === k) || {}).color || "#807d76";
 const WHERES = ["home", "anywhere", "out"];
+const KINDS = ["practice", "task", "pipeline"];
+// Default funnel for a new pipeline activity — the locked erasure model.
+// Erasure = a pipeline: the app serves the stage that's starving the funnel.
+const ERASURE_STAGES = ["Accroches", "Mots favoris", "Groupes", "Poème", "Forme"];
+const mkStages = (labels) => labels.map((t) => ({ id: uid(), text: t }));
 
 // ---------- seed (everything editable) ----------
-const A = (name, domain, where, perWeek, actions, kind = "practice", items = [], capMin = 0, capWeek = 0) => ({
+const A = (name, domain, where, perWeek, actions, kind = "practice", items = [], capMin = 0, capWeek = 0, stages = []) => ({
   id: uid(), name, domain, where, perWeek, kind, deadline: null, done: false, capMin, capWeek,
   actions: actions.map(([text, min]) => ({ id: uid(), text, min })),
   items: items.map((t) => ({ id: uid(), text: t, status: "doing" })),
+  stages: mkStages(stages),
   note: "",
 });
 // Generic starter set — a blank canvas. Edit these (or wipe them) in the
@@ -148,6 +154,33 @@ function placeOk(a, place) {
   if (place === "out") return a.where === "out" || a.where === "anywhere";
   return a.where === "home" || a.where === "anywhere"; // home
 }
+// ---------- pipeline picker ----------
+// A pipeline doesn't propose a generic action — it proposes the next ATOMIC
+// micro-step on a *specific piece at a specific stage*. Rule: serve the stage
+// that's starving the funnel — in practice, push the piece furthest along toward
+// the end (keep poems flowing out), while keeping organic randomness: sometimes
+// start a fresh piece at the top instead. The piece's stage is advanced later by
+// Claude reading the after-session comment — this only decides what to surface.
+function pipelineStep(a) {
+  const stages = a.stages || [];
+  if (!stages.length) return null;
+  const last = stages.length - 1;
+  const label = (i) => (stages[i] ? stages[i].text : "—");
+  const pieces = (a.items || []).filter((it) => typeof it.stage === "number");
+  const live = pieces.filter((p) => p.stage < last); // not yet at the final stage
+  // chance to start a fresh piece: always possible, higher when the funnel is thin
+  const freshChance = live.length ? Math.min(0.5, 1 / (live.length + 1)) : 1;
+  if (Math.random() < freshChance) {
+    return { id: uid(), text: `${label(0)} — nouvelle pièce`, min: 15, pieceId: null, pieceStage: 0, fresh: true };
+  }
+  // advance a live piece — bias toward the furthest-along (closest to shipping),
+  // jittered so every piece keeps a chance
+  const chosen = live
+    .map((p) => ({ p, w: (p.stage + 1) * (0.7 + Math.random() * 0.6) }))
+    .sort((x, y) => y.w - x.w)[0].p;
+  return { id: uid(), text: `${label(chosen.stage)} — « ${chosen.text} »`, min: 15, pieceId: chosen.id, pieceStage: chosen.stage, fresh: false };
+}
+
 function pick(activities, log, place, maxMin, relax = false, avoidId = null) {
   const elig = [];
   for (const a of activities) {
@@ -158,15 +191,21 @@ function pick(activities, log, place, maxMin, relax = false, avoidId = null) {
       if (a.capWeek > 0 && doneThisWeek(log, a.id) >= a.capWeek) continue; // hard weekly cap (e.g. meal prep)
     }
     if (!placeOk(a, place)) continue;
-    const acts = a.actions.filter((ac) => maxMin == null || ac.min <= maxMin);
-    if (!acts.length) continue;
-    elig.push({ a, acts, w: weight(a, log) });
+    if (a.kind === "pipeline") {
+      if (!(a.stages || []).length) continue; // needs a funnel; the step is synthesized, not from a.actions
+      elig.push({ a, acts: null, w: weight(a, log) });
+    } else {
+      const acts = a.actions.filter((ac) => maxMin == null || ac.min <= maxMin);
+      if (!acts.length) continue;
+      elig.push({ a, acts, w: weight(a, log) });
+    }
   }
   if (!elig.length) return null;
   const total = elig.reduce((s, e) => s + e.w, 0);
   let r = Math.random() * total, chosen = elig[0];
   for (const e of elig) { if (r < e.w) { chosen = e; break; } r -= e.w; }
-  const action = chosen.acts[Math.floor(Math.random() * chosen.acts.length)];
+  const action = chosen.a.kind === "pipeline" ? pipelineStep(chosen.a) : chosen.acts[Math.floor(Math.random() * chosen.acts.length)];
+  if (!action) return null;
   return { activity: chosen.a, action };
 }
 function reasonFor(a, log, place, action) {
@@ -268,6 +307,14 @@ function Throughline() {
   const [pasteVal, setPasteVal] = useState("");
   const [msg, setMsg] = useState("");
 
+  // after-session comment + the Claude bridge that advances pipeline pieces
+  const [comment, setComment] = useState("");
+  const [doneEntryId, setDoneEntryId] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [keyOpen, setKeyOpen] = useState(false);
+
   useEffect(() => {
     // Ask the browser to keep our data — without this, phones may evict
     // localStorage under storage pressure. With it, data stays until you
@@ -278,9 +325,11 @@ function Throughline() {
       const a = await loadJSON("tlx_activities", null);
       const l = await loadJSON("tlx_log", null);
       const hs = await loadJSON("tlx_hold", null);
+      const k = await store.get("tlx_apiKey");
       if (!alive) return;
       setActivities(a ?? SEED);
       setLog(l ?? []);
+      setApiKey(k || "");
       if (hs && hs.date === todayKey()) { setHoldMs(hs.ms); setHoldDate(hs.date); } // same day → keep the accumulated penalty
       else { setHoldMs(BASE_HOLD_MS); setHoldDate(todayKey()); }                    // new day → back to 10s
       setLoading(false);
@@ -320,7 +369,91 @@ function Throughline() {
     saveJSON("tlx_hold", { date: today, ms: next });
     propose(log, activities, false, current ? current.activity.id : null);
   };
-  const resetFlow = () => { setStage("entry"); setCurrent(null); setShowWhy(false); setRunning(false); setElapsedMs(0); };
+  const resetFlow = () => { setStage("entry"); setCurrent(null); setShowWhy(false); setRunning(false); setElapsedMs(0); setComment(""); setSyncMsg(""); setSyncing(false); };
+
+  // ----- after-session comment → advance the pipeline piece via a direct Claude call -----
+  // The comment is the ONLY thing that moves a pipeline piece forward (no tap-to-advance).
+  // When one is left on a pipeline action, send it + the funnel + current stage to the
+  // Messages API and let Claude decide the piece's new stage, inline at finish().
+  const saveKey = () => { store.set("tlx_apiKey", apiKey.trim()); setKeyOpen(false); setMsg(apiKey.trim() ? "key saved" : "key cleared"); setTimeout(() => setMsg(""), 1500); };
+  const clearKey = () => { store.set("tlx_apiKey", ""); setApiKey(""); setMsg("key cleared"); setTimeout(() => setMsg(""), 1500); };
+
+  const advanceViaClaude = async (key, text) => {
+    const act = current.activity, action = current.action;
+    const stages = act.stages || [];
+    const last = stages.length - 1;
+    const piece = action.pieceId ? (act.items || []).find((it) => it.id === action.pieceId) : null;
+    const ctx = action.fresh
+      ? `Une pièce FRAÎCHE vient d'être lancée (pas encore de nom). Le pas proposé était : "${action.text}".`
+      : `Pièce existante : « ${piece ? piece.text : "?"} », à l'étape ${action.pieceStage} (${(stages[action.pieceStage] || {}).text || "?"}).`;
+    const prompt = `Tu suis l'avancement d'un poème dans un funnel d'écriture (erasure).
+Étapes du funnel (index: nom) :
+${stages.map((s, i) => `${i}: ${s.text}`).join("\n")}
+
+${ctx}
+
+Commentaire laissé après la session :
+« ${text} »
+
+Détermine où en est la pièce APRÈS cette session. new_stage = index (0 à ${last}) de l'étape courante : si une étape vient d'être finie, avance à la suivante, sinon garde l'étape. piece_name = nom court (existant, ou tiré du commentaire si fraîche). note = une ligne qui distille ce qui a été fait.`;
+    setSyncing(true); setSyncMsg("lecture du commentaire…");
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "claude-opus-4-8",
+          max_tokens: 300,
+          messages: [{ role: "user", content: prompt }],
+          output_config: { format: { type: "json_schema", schema: {
+            type: "object",
+            properties: { piece_name: { type: "string" }, new_stage: { type: "integer" }, note: { type: "string" } },
+            required: ["piece_name", "new_stage", "note"],
+            additionalProperties: false,
+          } } },
+        }),
+      });
+      if (!res.ok) throw new Error("http " + res.status);
+      const data = await res.json();
+      const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+      const out = JSON.parse(txt);
+      const ns = Math.max(0, Math.min(last, parseInt(out.new_stage)));
+      const aid = act.id;
+      setActivities((arr) => arr.map((a) => {
+        if (a.id !== aid) return a;
+        let items = a.items || [];
+        if (action.fresh) items = [...items, { id: uid(), text: out.piece_name || "(sans nom)", stage: ns }];
+        else if (action.pieceId) items = items.map((it) => (it.id === action.pieceId ? { ...it, stage: ns } : it));
+        return { ...a, items };
+      }));
+      if (doneEntryId) setLog((L) => L.map((en) => (en.id === doneEntryId ? { ...en, note: text, claudeNote: out.note } : en)));
+      setSyncMsg(`« ${out.piece_name} » → ${(stages[ns] || {}).text || "?"}`);
+    } catch (err) {
+      setSyncMsg("lecture impossible (" + (err.message || "erreur") + ") — commentaire gardé");
+    } finally {
+      setSyncing(false);
+      setTimeout(() => { setSyncMsg(""); setComment(""); resetFlow(); }, 2400);
+    }
+  };
+
+  const submitComment = async () => {
+    const text = comment.trim();
+    if (text && doneEntryId) setLog((L) => L.map((en) => (en.id === doneEntryId ? { ...en, note: text } : en)));
+    const isPipe = current && current.activity.kind === "pipeline";
+    if (isPipe && text) {
+      const key = (await store.get("tlx_apiKey")) || "";
+      if (key) { advanceViaClaude(key, text); return; }
+      setSyncMsg("pas de clé API — commentaire gardé, pièce non avancée");
+      setTimeout(() => { setSyncMsg(""); setComment(""); resetFlow(); }, 2200);
+      return;
+    }
+    setComment(""); resetFlow();
+  };
 
   // section navigation — no tab bar; swipe left/right or tap the faint edge arrows.
   const TABS = ["now", "activities", "progress"];
@@ -355,8 +488,10 @@ function Throughline() {
     if (current.activity.kind === "task") {
       setActivities((arr) => arr.map((a) => (a.id === aid ? { ...a, done: true } : a)));
     }
+    setDoneEntryId(e.id);
     setLog((L) => [...L, e]);
     setRunning(false); setShowWhy(false); // keep `current` so the line stays frozen-full on "done"
+    setComment("");
     setStage("done");
   };
 
@@ -392,13 +527,40 @@ function Throughline() {
   // ----- activity mutations -----
   const upd = (id, patch) => setActivities((arr) => arr.map((a) => (a.id === id ? { ...a, ...patch } : a)));
   const addActivity = () =>
-    setActivities((arr) => [...arr, { id: uid(), name: "", domain: "creative", where: "home", perWeek: 1, kind: "practice", deadline: null, done: false, capMin: 0, capWeek: 0, actions: [{ id: uid(), text: "", min: 15 }], items: [], note: "" }]);
+    setActivities((arr) => [...arr, { id: uid(), name: "", domain: "creative", where: "home", perWeek: 1, kind: "practice", deadline: null, done: false, capMin: 0, capWeek: 0, actions: [{ id: uid(), text: "", min: 15 }], items: [], stages: [], note: "" }]);
   const delActivity = (id) => setActivities((arr) => arr.filter((a) => a.id !== id));
   const addAction = (id) => upd(id, { actions: [...activities.find((a) => a.id === id).actions, { id: uid(), text: "", min: 15 }] });
   const editAction = (id, aid, patch) => upd(id, { actions: activities.find((a) => a.id === id).actions.map((ac) => (ac.id === aid ? { ...ac, ...patch } : ac)) });
   const delAction = (id, aid) => upd(id, { actions: activities.find((a) => a.id === id).actions.filter((ac) => ac.id !== aid) });
-  const addItem = (id, text) => { if (!text.trim()) return; upd(id, { items: [...activities.find((a) => a.id === id).items, { id: uid(), text, status: "doing" }] }); };
-  const cycleItem = (id, iid) => { const order = ["todo", "doing", "done"]; upd(id, { items: activities.find((a) => a.id === id).items.map((it) => (it.id === iid ? { ...it, status: order[(order.indexOf(it.status) + 1) % 3] } : it)) }); };
+  const addStage = (id) => upd(id, { stages: [...(activities.find((a) => a.id === id).stages || []), { id: uid(), text: "" }] });
+  const editStage = (id, sid, patch) => upd(id, { stages: (activities.find((a) => a.id === id).stages || []).map((s) => (s.id === sid ? { ...s, ...patch } : s)) });
+  const delStage = (id, sid) => upd(id, { stages: (activities.find((a) => a.id === id).stages || []).filter((s) => s.id !== sid) });
+  const moveStage = (id, sid, dir) => upd(id, { stages: (() => {
+    const arr = [...(activities.find((a) => a.id === id).stages || [])];
+    const i = arr.findIndex((s) => s.id === sid), j = i + dir;
+    if (i < 0 || j < 0 || j >= arr.length) return arr;
+    [arr[i], arr[j]] = [arr[j], arr[i]]; return arr;
+  })() });
+  const addItem = (id, text) => {
+    if (!text.trim()) return;
+    const a = activities.find((x) => x.id === id);
+    // pipeline pieces enter at the first stage; balance/task items keep the todo/doing/done model
+    const piece = a && a.kind === "pipeline" ? { id: uid(), text, stage: 0 } : { id: uid(), text, status: "doing" };
+    upd(id, { items: [...a.items, piece] });
+  };
+  const cycleItem = (id, iid) => {
+    const a = activities.find((x) => x.id === id);
+    if (a && a.kind === "pipeline") {
+      // a pipeline piece advances through the funnel stages, not todo/doing/done.
+      // Tapping here is for setup/correction in the editor — in the live flow, Claude
+      // advances the stage from the after-session comment (no manual tapping there).
+      const n = (a.stages || []).length || 1;
+      upd(id, { items: a.items.map((it) => (it.id === iid ? { ...it, stage: (((it.stage ?? 0) + 1) % n) } : it)) });
+      return;
+    }
+    const order = ["todo", "doing", "done"];
+    upd(id, { items: a.items.map((it) => (it.id === iid ? { ...it, status: order[(order.indexOf(it.status) + 1) % 3] } : it)) });
+  };
   const delItem = (id, iid) => upd(id, { items: activities.find((a) => a.id === id).items.filter((it) => it.id !== iid) });
   const quickLog = (a) => {
     const ac = a.actions[0] || { id: uid(), text: a.name, min: 15 };
@@ -539,7 +701,20 @@ function Throughline() {
 
                 {stage === "done" && (
                   <div className="fade">
-                    <button className="link" onClick={resetFlow}>that's it for now</button>
+                    {(syncing || syncMsg) ? (
+                      <div className="mono" style={{ fontSize: 11, color: C.bone, letterSpacing: ".06em", lineHeight: 1.6 }}>{syncMsg || "…"}</div>
+                    ) : (
+                      <>
+                        <input className="in" value={comment} placeholder="un mot sur cette session ?"
+                          onChange={(e) => setComment(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") submitComment(); }}
+                          style={{ fontSize: 14, textAlign: "center", maxWidth: 360, margin: "0 auto", display: "block", borderBottom: `1px solid ${C.line}`, paddingBottom: 8, fontStyle: comment ? "normal" : "italic", color: comment ? C.text : C.faint }} />
+                        <button className="link" style={{ marginTop: 18 }} onClick={submitComment}>{comment.trim() ? "valider" : "passer"}</button>
+                        {current && current.activity.kind === "pipeline" && (
+                          <div className="mono" style={{ fontSize: 9, color: C.faint, marginTop: 14, letterSpacing: ".06em" }}>ton mot fait avancer la pièce dans le funnel</div>
+                        )}
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -553,6 +728,7 @@ function Throughline() {
             {activities.map((a) => (
               <ActivityCard key={a.id} a={a} upd={upd} del={delActivity}
                 addAction={addAction} editAction={editAction} delAction={delAction}
+                addStage={addStage} editStage={editStage} delStage={delStage} moveStage={moveStage}
                 addItem={addItem} cycleItem={cycleItem} delItem={delItem} />
             ))}
             <button className="link" style={{ marginTop: 20 }} onClick={addActivity}>+ add activity</button>
@@ -569,7 +745,22 @@ function Throughline() {
             <label className="link" style={{ cursor: "pointer" }}>load
               <input type="file" accept="application/json,.json" onChange={onFile} style={{ display: "none" }} />
             </label>
+            <button className="link" onClick={() => setKeyOpen((o) => !o)}>key{apiKey ? " ·" : ""}</button>
           </div>
+          {keyOpen && (
+            <div style={{ marginTop: 18, maxWidth: 320, marginLeft: "auto", marginRight: "auto" }}>
+              <input className="in" type="password" value={apiKey} placeholder="anthropic api key — sk-ant-…"
+                onChange={(e) => setApiKey(e.target.value)}
+                style={{ fontSize: 12, textAlign: "center", borderBottom: `1px solid ${C.line}`, paddingBottom: 6 }} />
+              <div style={{ display: "flex", justifyContent: "center", gap: 20, marginTop: 12 }}>
+                <button className="link" onClick={saveKey}>save key</button>
+                <button className="link" onClick={clearKey}>clear</button>
+              </div>
+              <div className="mono" style={{ fontSize: 9, color: C.faint, marginTop: 10, lineHeight: 1.6 }}>
+                stored only on this device — never committed. reads your after-session comments to advance the funnel; sent only to anthropic.
+              </div>
+            </div>
+          )}
           <button className="link" style={{ color: C.line, marginTop: 22 }} onClick={resetAll}>reset</button>
         </div>
 
@@ -584,7 +775,7 @@ function Throughline() {
 }
 
 /* ------------------------- activity editor ------------------------- */
-function ActivityCard({ a, upd, del, addAction, editAction, delAction, addItem, cycleItem, delItem }) {
+function ActivityCard({ a, upd, del, addAction, editAction, delAction, addStage, editStage, delStage, moveStage, addItem, cycleItem, delItem }) {
   const [open, setOpen] = useState(false);
   const [itemDraft, setItemDraft] = useState("");
   const statusColor = (s) => (s === "done" ? C.bone : s === "doing" ? C.mut : C.faint);
@@ -613,12 +804,13 @@ function ActivityCard({ a, upd, del, addAction, editAction, delAction, addItem, 
             </Meta>
             <Meta label="kind">
               <div style={{ display: "flex", gap: 5 }}>
-                {["practice", "task"].map((k) => (
-                  <button key={k} className={`chip ${a.kind === k ? "on" : ""}`} onClick={() => upd(a.id, { kind: k, done: false })}>{k}</button>
+                {KINDS.map((k) => (
+                  <button key={k} className={`chip ${a.kind === k ? "on" : ""}`}
+                    onClick={() => upd(a.id, { kind: k, done: false, ...(k === "pipeline" && !(a.stages || []).length ? { stages: mkStages(ERASURE_STAGES) } : {}) })}>{k}</button>
                 ))}
               </div>
             </Meta>
-            {a.kind === "practice" ? (
+            {a.kind !== "task" ? (
               <>
               <Meta label="per week">
                 <input className="in mono" type="number" min="0" value={a.perWeek}
@@ -640,6 +832,30 @@ function ActivityCard({ a, upd, del, addAction, editAction, delAction, addItem, 
             )}
           </div>
 
+          {/* stages — the pipeline funnel, in order (the app serves the one that's starving) */}
+          {a.kind === "pipeline" && (
+            <div style={{ marginBottom: 22 }}>
+              <div className="lab" style={{ marginBottom: 10 }}>stages — the funnel, in order</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+                {(a.stages || []).map((s, i) => (
+                  <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span className="mono" style={{ fontSize: 10, color: C.faint, width: 14, textAlign: "right" }}>{i + 1}</span>
+                    <input className="in" value={s.text} placeholder="stage name"
+                      onChange={(e) => editStage(a.id, s.id, { text: e.target.value })}
+                      style={{ fontSize: 15, fontWeight: 300, fontStyle: s.text ? "normal" : "italic", color: s.text ? C.text : C.faint, borderBottom: `1px solid ${C.soft}`, paddingBottom: 5 }} />
+                    <button className="ghost" onClick={() => moveStage(a.id, s.id, -1)} style={{ opacity: i === 0 ? 0.25 : 1, padding: "0 2px" }} aria-label="move up">↑</button>
+                    <button className="ghost" onClick={() => moveStage(a.id, s.id, 1)} style={{ opacity: i === (a.stages.length - 1) ? 0.25 : 1, padding: "0 2px" }} aria-label="move down">↓</button>
+                    <button className="x" onClick={() => delStage(a.id, s.id)}>×</button>
+                  </div>
+                ))}
+                {!(a.stages || []).length && (
+                  <div className="mono" style={{ fontSize: 11, color: C.faint, fontStyle: "italic" }}>no stages yet — add the funnel below</div>
+                )}
+              </div>
+              <button className="link" style={{ marginTop: 12 }} onClick={() => addStage(a.id)}>+ stage</button>
+            </div>
+          )}
+
           {/* actions */}
           <div className="lab" style={{ marginBottom: 10 }}>actions — what actually shows up</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
@@ -658,19 +874,27 @@ function ActivityCard({ a, upd, del, addAction, editAction, delAction, addItem, 
           </div>
           <button className="link" style={{ marginTop: 12 }} onClick={() => addAction(a.id)}>+ action</button>
 
-          {/* progress items */}
-          <div className="lab" style={{ margin: "22px 0 10px" }}>progress — pieces, materials, milestones</div>
+          {/* progress items / pipeline pieces */}
+          <div className="lab" style={{ margin: "22px 0 10px" }}>{a.kind === "pipeline" ? "pieces — where each sits in the funnel" : "progress — pieces, materials, milestones"}</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-            {a.items.map((it) => (
+            {a.items.map((it) => {
+              const isPipe = a.kind === "pipeline";
+              const st = (a.stages || [])[it.stage ?? 0];
+              const stageTxt = st ? st.text : "—";
+              const isDone = !isPipe && it.status === "done";
+              return (
               <div key={it.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <button className="chip" onClick={() => cycleItem(a.id, it.id)} style={{ minWidth: 58, color: statusColor(it.status), borderColor: it.status === "done" ? C.bone : C.line }}>{it.status}</button>
-                <span style={{ flex: 1, fontSize: 14, fontWeight: 300, color: it.status === "done" ? C.mut : C.text, textDecoration: it.status === "done" ? "line-through" : "none" }}>{it.text}</span>
+                <button className="chip" onClick={() => cycleItem(a.id, it.id)}
+                  title={isPipe ? "set stage (setup / correction)" : "cycle status"}
+                  style={{ minWidth: 64, color: isPipe ? C.mut : statusColor(it.status), borderColor: isDone ? C.bone : C.line }}>{isPipe ? stageTxt : it.status}</button>
+                <span style={{ flex: 1, fontSize: 14, fontWeight: 300, color: isDone ? C.mut : C.text, textDecoration: isDone ? "line-through" : "none" }}>{it.text}</span>
                 <button className="x" onClick={() => delItem(a.id, it.id)}>×</button>
               </div>
-            ))}
+              );
+            })}
           </div>
           <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
-            <input className="in" value={itemDraft} placeholder="add one"
+            <input className="in" value={itemDraft} placeholder={a.kind === "pipeline" ? "add a piece (e.g. a phrase)" : "add one"}
               onChange={(e) => setItemDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") { addItem(a.id, itemDraft); setItemDraft(""); } }}
               style={{ fontSize: 14, fontStyle: "italic", borderBottom: `1px solid ${C.soft}`, paddingBottom: 4 }} />
@@ -759,7 +983,9 @@ function Progress({ activities, log, quickLog, delLog }) {
             const wkMin = log.filter((e) => e.date >= ws && e.activityId === a.id && isDone(e)).reduce((s, e) => s + (e.min || 0), 0);
             const totMin = log.filter((e) => e.activityId === a.id && isDone(e)).reduce((s, e) => s + (e.min || 0), 0);
             const items = a.items || [];
+            const isPipe = a.kind === "pipeline";
             const doneItems = items.filter((i) => i.status === "done").length;
+            const stageTxt = (it) => { const s = (a.stages || [])[it.stage ?? 0]; return s ? s.text : "—"; };
             return (
               <div key={a.id}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -769,12 +995,18 @@ function Progress({ activities, log, quickLog, delLog }) {
                 </div>
                 {items.length > 0 && (
                   <div style={{ paddingLeft: 18, marginTop: 8 }}>
-                    <span className="mono" style={{ fontSize: 9.5, color: C.faint, letterSpacing: ".08em" }}>{doneItems}/{items.length} done</span>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                    <span className="mono" style={{ fontSize: 9.5, color: C.faint, letterSpacing: ".08em" }}>{isPipe ? `${items.length} piece${items.length > 1 ? "s" : ""} in the funnel` : `${doneItems}/${items.length} done`}</span>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
                       {items.map((it) => (
-                        <span key={it.id} className="mono" style={{ fontSize: 10.5, color: it.status === "done" ? C.mut : C.text, textDecoration: it.status === "done" ? "line-through" : "none" }}>
-                          {it.text}{it.status === "doing" ? " ·" : ""}
-                        </span>
+                        isPipe ? (
+                          <span key={it.id} className="mono" style={{ fontSize: 10.5, color: C.text }}>
+                            {it.text} <span style={{ color: C.faint }}>· {stageTxt(it)}</span>
+                          </span>
+                        ) : (
+                          <span key={it.id} className="mono" style={{ fontSize: 10.5, color: it.status === "done" ? C.mut : C.text, textDecoration: it.status === "done" ? "line-through" : "none" }}>
+                            {it.text}{it.status === "doing" ? " ·" : ""}
+                          </span>
+                        )
                       ))}
                     </div>
                   </div>
