@@ -260,6 +260,15 @@ function itemStep(a, log) {
   return { id: base.id, text: pick.text, min: base.min, itemId: pick.id };
 }
 
+// Returns false if the activity has a cooldownH field and was done within that window.
+// Used to space pipeline sessions that need real-world rest time (e.g. parfum-création 48h).
+function cooldownOk(a, log) {
+  if (!a.cooldownH) return true;
+  const cutoff = Date.now() - a.cooldownH * 3600000;
+  for (const e of log) if (e.activityId === a.id && isDone(e) && e.ts >= cutoff) return false;
+  return true;
+}
+
 function pick(activities, log, place, maxMin, relax = false, avoidId = null) {
   const elig = [];
   for (const a of activities) {
@@ -268,6 +277,7 @@ function pick(activities, log, place, maxMin, relax = false, avoidId = null) {
     if (!relax) {
       if (a.capMin > 0 && minutesToday(log, a.id) >= a.capMin) continue;   // hard daily minutes cap (e.g. treadmill)
       if (a.capWeek > 0 && doneLast7(log, a.id) >= a.capWeek) continue;     // hard cap over the rolling 7 days (e.g. meal prep)
+      if (!cooldownOk(a, log)) continue;                                     // time-gap cooldown (e.g. parfum-création 48h)
     }
     if (!placeOk(a, place)) continue;
     if (a.kind === "pipeline") {
