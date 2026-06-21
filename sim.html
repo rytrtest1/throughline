@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>throughline — sim</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=Spectral:ital,wght@0,300;0,400;1,300&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0a0a0b;--text:#ece9e3;--mut:#8a877f;--faint:#56544e;--line:#222226;--soft:#18181b;--bone:#d6cfbf;--serif:'Spectral',Georgia,serif;--mono:'IBM Plex Mono',ui-monospace,Menlo,monospace}
+html,body{background:var(--bg);color:var(--text);min-height:100vh;font-family:var(--serif)}
+.wrap{max-width:600px;margin:0 auto;padding:28px 20px 80px}
+.lab{font-family:var(--mono);font-size:10px;letter-spacing:.22em;text-transform:uppercase;color:var(--faint)}
+.mono{font-family:var(--mono)}
+hr{height:1px;background:var(--line);border:none;margin:20px 0}
+button{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;background:none;border:1px solid var(--line);color:var(--mut);cursor:pointer;padding:10px 16px;transition:all .2s}
+button:hover{border-color:var(--mut);color:var(--text)}
+button.on{color:var(--bg);background:var(--bone);border-color:var(--bone)}
+button.big{font-size:13px;padding:18px;width:100%;border-color:var(--bone);color:var(--bone)}
+button.big:hover{background:var(--bone);color:var(--bg)}
+button.accept{border-color:#88a08a;color:#88a08a}
+button.accept:hover{background:#88a08a;color:var(--bg)}
+button.skip{border-color:var(--faint);color:var(--faint)}
+.file-btn{display:inline-block;cursor:pointer;font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut);border:1px solid var(--line);padding:8px 14px;transition:all .2s}
+.file-btn:hover{border-color:var(--mut);color:var(--text)}
+input[type=file]{display:none}
+.pick-box{border:1px solid var(--line);padding:24px;margin:20px 0}
+.pick-name{font-size:22px;font-weight:300;line-height:1.3;margin-bottom:6px}
+.pick-action{font-family:var(--mono);font-size:12px;color:var(--mut);margin-bottom:4px}
+.pick-meta{font-family:var(--mono);font-size:10px;color:var(--faint)}
+.actions-row{display:flex;gap:10px;margin-top:16px}
+.actions-row button{flex:1}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+th{text-align:left;color:var(--faint);font-size:9px;letter-spacing:.18em;text-transform:uppercase;padding:6px 8px 6px 0;border-bottom:1px solid var(--line)}
+td{padding:7px 8px 7px 0;border-bottom:1px solid var(--soft);color:var(--mut);vertical-align:top}
+td.name{color:var(--text)}
+td.force{color:var(--bone)}
+.bar{height:3px;background:var(--line);margin-top:4px;border-radius:2px}
+.bar-fill{height:3px;background:var(--bone);border-radius:2px;transition:width .3s}
+.hist-item{font-family:var(--mono);font-size:11px;color:var(--faint);padding:5px 0;border-bottom:1px solid var(--soft)}
+.hist-item .n{color:var(--text)}
+.place-row{display:flex;gap:8px;margin-bottom:16px;align-items:center}
+.place-row .lab{margin-right:8px}
+.day-row{display:flex;gap:12px;align-items:center;margin-bottom:20px}
+.day-row .lab{margin-right:4px}
+.day-str{font-family:var(--mono);font-size:13px;color:var(--text)}
+[hidden]{display:none!important}
+.tag{font-family:var(--mono);font-size:9px;letter-spacing:.12em;text-transform:uppercase;padding:2px 7px;border:1px solid var(--line);color:var(--faint)}
+.status-line{font-family:var(--mono);font-size:10px;color:var(--faint);min-height:16px;margin:6px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div style="margin-bottom:28px">
+    <div class="lab" style="margin-bottom:12px">throughline — simulateur</div>
+
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <label class="file-btn" for="f-cat">catalogue <input type="file" id="f-cat" accept=".json"></label>
+      <label class="file-btn" for="f-log">log réel (optionnel) <input type="file" id="f-log" accept=".json"></label>
+      <button onclick="resetSim()" style="border-color:var(--faint);color:var(--faint)">reset</button>
+    </div>
+    <div class="status-line" id="status">— charger un catalogue pour commencer</div>
+  </div>
+
+  <div id="sim" hidden>
+    <hr>
+
+    <!-- day + place -->
+    <div class="day-row">
+      <span class="lab">jour</span>
+      <span class="day-str" id="day-label"></span>
+      <button onclick="prevDay()">←</button>
+      <button onclick="nextDay()">→</button>
+    </div>
+    <div class="place-row">
+      <span class="lab">lieu</span>
+      <button id="pl-home" class="on" onclick="setPlace('home')">home</button>
+      <button id="pl-work" onclick="setPlace('work')">work</button>
+      <button id="pl-out" onclick="setPlace('out')">out</button>
+    </div>
+
+    <!-- pick -->
+    <button class="big" id="btn-propose" onclick="propose()">proposer</button>
+
+    <div id="pick-area" hidden>
+      <div class="pick-box">
+        <div class="pick-name" id="pick-name"></div>
+        <div class="pick-action" id="pick-action"></div>
+        <div class="pick-meta" id="pick-meta"></div>
+        <div class="actions-row">
+          <button class="accept" onclick="accept()">accepter ✓</button>
+          <button class="skip" onclick="skip()">passer ✗</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="empty-msg" hidden style="font-family:var(--mono);font-size:12px;color:var(--faint);padding:20px 0">
+      aucune activité éligible — essaie un autre lieu ou jour suivant.
+    </div>
+
+    <!-- history -->
+    <div id="hist-wrap" hidden>
+      <hr>
+      <div class="lab" style="margin-bottom:10px">historique sim</div>
+      <div id="hist"></div>
+    </div>
+
+    <!-- weights -->
+    <hr>
+    <div class="lab" style="margin-bottom:12px">poids actuels</div>
+    <table>
+      <thead>
+        <tr>
+          <th>activité</th>
+          <th>retard</th>
+          <th style="text-align:right">force</th>
+        </tr>
+      </thead>
+      <tbody id="wtable"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// ===== engine (copied verbatim from index.html) =====
+const pad = (n) => String(n).padStart(2, "0");
+const keyOf = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const fromKey = (s) => new Date(s + "T00:00:00");
+const daysBetween = (a, b) => Math.round((fromKey(b) - fromKey(a)) / 86400000);
+const uid = () => Math.random().toString(36).slice(2, 9);
+const isDone = (e) => e.type !== "skip";
+
+// simulated today — controlled by the sim
+let SIM_DATE = keyOf(new Date());
+const todayKey = () => SIM_DATE;
+const daysAgoKey = (n) => { const d = fromKey(SIM_DATE); d.setDate(d.getDate() - n); return keyOf(d); };
+
+function doneLast7(log, id) {
+  const since = daysAgoKey(6);
+  return log.filter((e) => e.date >= since && e.activityId === id && isDone(e)).length;
+}
+function doneActionLast7(log, id, actionId) {
+  const since = daysAgoKey(6);
+  return log.filter((e) => e.date >= since && e.activityId === id && e.actionId === actionId && isDone(e)).length;
+}
+function minutesToday(log, id) {
+  const t = todayKey();
+  return log.filter((e) => e.date === t && e.activityId === id && isDone(e)).reduce((s, e) => s + (e.min || 0), 0);
+}
+function daysSinceLast(log, id) {
+  let last = null;
+  for (const e of log) if (e.activityId === id && isDone(e) && (!last || e.date > last)) last = e.date;
+  return last ? daysBetween(last, todayKey()) : 999;
+}
+function daysSinceLastAction(log, id, actionId) {
+  let last = null;
+  for (const e of log) if (e.activityId === id && e.actionId === actionId && isDone(e) && (!last || e.date > last)) last = e.date;
+  return last ? daysBetween(last, todayKey()) : 999;
+}
+const OVERDUE_CAP = 3, BONUS_MULT = 0.4;
+function forceFrom(daysSince, perWeek, bonus) {
+  const jit = 0.7 + Math.random() * 0.6;
+  const pw = perWeek > 0 ? perWeek : 0.5;
+  const interval = 7 / pw;
+  const overdue = Math.min(OVERDUE_CAP, daysSince / interval);
+  let f = Math.sqrt(pw) * overdue * jit;
+  if (bonus) f *= BONUS_MULT;
+  return Math.max(0.02, f);
+}
+// Deterministic version (no jitter) for display
+function forceBase(daysSince, perWeek, bonus) {
+  const pw = perWeek > 0 ? perWeek : 0.5;
+  const interval = 7 / pw;
+  const overdue = Math.min(OVERDUE_CAP, daysSince / interval);
+  let f = Math.sqrt(pw) * overdue;
+  if (bonus) f *= BONUS_MULT;
+  return Math.max(0, f);
+}
+function weight(a, log) {
+  if (a.kind === "task" && a.deadline) {
+    const d = daysBetween(todayKey(), a.deadline);
+    if (d <= 0) return 60; if (d <= 2) return 14; if (d <= 7) return 5; return 2;
+  }
+  return forceFrom(daysSinceLast(log, a.id), a.perWeek, a.bonus);
+}
+const isPerAction = (a) => Array.isArray(a.actions) && a.actions.some((ac) => typeof ac.perWeek === "number");
+function actionWeight(a, ac, log) {
+  return forceFrom(daysSinceLastAction(log, a.id, ac.id), ac.perWeek, a.bonus || ac.bonus);
+}
+function placeOk(a, place) {
+  if (place === "work") return a.where === "anywhere";
+  if (place === "out") return a.where === "out" || a.where === "anywhere";
+  return a.where === "home" || a.where === "anywhere" || a.where === "out";
+}
+function cooldownOk(a, log) {
+  if (!a.cooldownH) return true;
+  const cutoff = Date.now() - a.cooldownH * 3600000;
+  for (const e of log) if (e.activityId === a.id && isDone(e) && e.ts >= cutoff) return false;
+  return true;
+}
+function pipelineStep(a) {
+  const stages = a.stages || [];
+  if (!stages.length) return null;
+  const last = stages.length - 1;
+  const label = (i) => (stages[i] ? stages[i].text : "—");
+  const pieces = (a.items || []).filter((it) => typeof it.stage === "number");
+  const live = pieces.filter((p) => p.stage < last);
+  const freshChance = live.length ? Math.min(0.5, 1 / (live.length + 1)) : 1;
+  if (Math.random() < freshChance)
+    return { id: uid(), text: `${label(0)} — nouvelle pièce`, min: 15, pieceId: null, pieceStage: 0, fresh: true };
+  const chosen = live.map((p) => ({ p, w: (p.stage + 1) * (0.7 + Math.random() * 0.6) })).sort((x, y) => y.w - x.w)[0].p;
+  return { id: uid(), text: `${label(chosen.stage)} — « ${chosen.text} »`, min: 15, pieceId: chosen.id, pieceStage: chosen.stage, fresh: false };
+}
+function hasDoingItems(a) {
+  return a.kind === "practice" && (a.items || []).some((it) => it.status === "doing");
+}
+function itemStep(a, log) {
+  const base = a.actions[0] || { id: uid(), text: "—", min: 15 };
+  const doing = (a.items || []).filter((it) => it.status === "doing");
+  if (!doing.length) return base;
+  const scored = doing.map((it) => {
+    let last = null;
+    for (const e of log) if (e.activityId === a.id && isDone(e) && e.itemId === it.id && (!last || e.date > last)) last = e.date;
+    const days = last ? daysBetween(last, todayKey()) : 999;
+    return { it, w: days * (0.7 + Math.random() * 0.6) };
+  });
+  const pick = scored.sort((x, y) => y.w - x.w)[0].it;
+  return { id: base.id, text: pick.text, min: base.min, itemId: pick.id };
+}
+function pick(activities, log, place, maxMin = null, relax = false, avoidId = null) {
+  const elig = [];
+  for (const a of activities) {
+    if (a.kind === "task" && a.done) continue;
+    if (a.id === avoidId) continue;
+    if (!relax) {
+      if (a.capMin > 0 && minutesToday(log, a.id) >= a.capMin) continue;
+      if (a.capWeek > 0 && doneLast7(log, a.id) >= a.capWeek) continue;
+      if (!cooldownOk(a, log)) continue;
+    }
+    if (!placeOk(a, place)) continue;
+    if (a.kind === "pipeline") {
+      if (!(a.stages || []).length) continue;
+      elig.push({ a, acts: null, w: weight(a, log) });
+    } else if (isPerAction(a)) {
+      for (const ac of a.actions) {
+        if (maxMin != null && ac.min > maxMin) continue;
+        elig.push({ a, acts: [ac], w: actionWeight(a, ac, log) });
+      }
+    } else {
+      const acts = a.actions.filter((ac) => maxMin == null || ac.min <= maxMin);
+      if (!acts.length) continue;
+      elig.push({ a, acts, w: weight(a, log) });
+    }
+  }
+  if (!elig.length) return null;
+  const total = elig.reduce((s, e) => s + e.w, 0);
+  let r = Math.random() * total, chosen = elig[0];
+  for (const e of elig) { if (r < e.w) { chosen = e; break; } r -= e.w; }
+  const action = chosen.a.kind === "pipeline"
+    ? pipelineStep(chosen.a)
+    : hasDoingItems(chosen.a)
+      ? itemStep(chosen.a, log)
+      : chosen.acts[Math.floor(Math.random() * chosen.acts.length)];
+  if (!action) return null;
+  return { activity: chosen.a, action };
+}
+
+// ===== sim state =====
+let activities = [];
+let simLog = [];
+let currentPick = null;
+let simPlace = "home";
+let histItems = [];
+
+// ===== load =====
+document.getElementById("f-cat").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then((t) => {
+    try {
+      const data = JSON.parse(t);
+      activities = Array.isArray(data) ? data : (data.activities || []);
+      document.getElementById("status").textContent = `${activities.length} activités chargées`;
+      document.getElementById("sim").hidden = false;
+      renderWeights();
+      renderDay();
+    } catch { document.getElementById("status").textContent = "erreur JSON — vérifie le fichier"; }
+  });
+});
+
+document.getElementById("f-log").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then((t) => {
+    try {
+      const data = JSON.parse(t);
+      simLog = Array.isArray(data) ? data : (data.log || []);
+      document.getElementById("status").textContent = `log chargé — ${simLog.length} entrées`;
+      renderWeights();
+    } catch { document.getElementById("status").textContent = "erreur log JSON"; }
+  });
+});
+
+// ===== day / place =====
+function renderDay() {
+  const d = fromKey(SIM_DATE);
+  const days = ["dim","lun","mar","mer","jeu","ven","sam"];
+  document.getElementById("day-label").textContent =
+    `${days[d.getDay()]} ${d.getDate()} ${d.toLocaleDateString("fr-FR",{month:"long"})}`;
+}
+function nextDay() { const d = fromKey(SIM_DATE); d.setDate(d.getDate()+1); SIM_DATE = keyOf(d); clearPick(); renderDay(); renderWeights(); }
+function prevDay() { const d = fromKey(SIM_DATE); d.setDate(d.getDate()-1); SIM_DATE = keyOf(d); clearPick(); renderDay(); renderWeights(); }
+function setPlace(p) {
+  simPlace = p;
+  ["home","work","out"].forEach((x) => document.getElementById("pl-"+x).classList.toggle("on", x===p));
+  clearPick(); renderWeights();
+}
+
+// ===== propose / accept / skip =====
+function propose() {
+  const p = pick(activities, simLog, simPlace);
+  document.getElementById("empty-msg").hidden = !!p;
+  document.getElementById("pick-area").hidden = !p;
+  if (!p) { currentPick = null; return; }
+  currentPick = p;
+  document.getElementById("pick-name").textContent = p.activity.name;
+  document.getElementById("pick-action").textContent = p.action.text;
+  const dsl = daysSinceLast(simLog, p.activity.id);
+  document.getElementById("pick-meta").textContent =
+    `${p.activity.domain} · ${p.action.min}min · dernier il y a ${dsl >= 999 ? "jamais" : dsl+"j"}`;
+}
+function accept() {
+  if (!currentPick) return;
+  const e = {
+    id: uid(), date: SIM_DATE, ts: Date.now(), type: "done",
+    activityId: currentPick.activity.id, actionId: currentPick.action.id,
+    actionText: currentPick.action.text, min: currentPick.action.min,
+    sec: currentPick.action.min * 60, domain: currentPick.activity.domain, note: "",
+    ...(currentPick.action.itemId ? { itemId: currentPick.action.itemId } : {}),
+  };
+  simLog.push(e);
+  addHist("✓", currentPick);
+  clearPick(); renderWeights();
+}
+function skip() {
+  if (!currentPick) return;
+  addHist("✗", currentPick);
+  clearPick(); renderWeights();
+}
+function clearPick() {
+  currentPick = null;
+  document.getElementById("pick-area").hidden = true;
+  document.getElementById("empty-msg").hidden = true;
+}
+
+// ===== history =====
+function addHist(sym, p) {
+  histItems.unshift({ sym, name: p.activity.name, action: p.action.text, date: SIM_DATE });
+  if (histItems.length > 20) histItems.pop();
+  const wrap = document.getElementById("hist-wrap");
+  wrap.hidden = false;
+  document.getElementById("hist").innerHTML = histItems.slice(0,10).map((h) =>
+    `<div class="hist-item">${h.sym} <span class="n">${h.name}</span> — ${h.action} <span style="color:var(--faint);font-size:9px">[${h.date}]</span></div>`
+  ).join("");
+}
+
+// ===== weight table =====
+function renderWeights() {
+  const rows = [];
+  for (const a of activities) {
+    if (a.kind === "task" && a.done) continue;
+    if (!placeOk(a, simPlace)) {
+      // show grayed-out
+      rows.push({ a, elig: false, force: 0, dsl: daysSinceLast(simLog, a.id), label: a.name });
+      continue;
+    }
+    if (!cooldownOk(a, simLog)) {
+      rows.push({ a, elig: false, force: 0, dsl: daysSinceLast(simLog, a.id), label: a.name, reason: "cooldown" });
+      continue;
+    }
+    if (a.capMin > 0 && minutesToday(simLog, a.id) >= a.capMin) {
+      rows.push({ a, elig: false, force: 0, dsl: daysSinceLast(simLog, a.id), label: a.name, reason: "cap" });
+      continue;
+    }
+    if (isPerAction(a)) {
+      for (const ac of a.actions) {
+        const dsl = daysSinceLastAction(simLog, a.id, ac.id);
+        const f = forceBase(dsl, ac.perWeek, a.bonus || ac.bonus);
+        rows.push({ a, ac, elig: true, force: f, dsl, label: `${a.name} — ${ac.text}` });
+      }
+    } else {
+      const dsl = daysSinceLast(simLog, a.id);
+      const f = forceBase(dsl, a.perWeek, a.bonus);
+      rows.push({ a, elig: true, force: f, dsl, label: a.name });
+    }
+  }
+  rows.sort((x, y) => y.force - x.force);
+  const maxF = Math.max(...rows.map((r) => r.force), 1);
+
+  document.getElementById("wtable").innerHTML = rows.map((r) => {
+    const dslStr = r.dsl >= 999 ? "jamais" : r.dsl === 0 ? "auj." : r.dsl + "j";
+    const barW = Math.round((r.force / maxF) * 100);
+    const nameCol = r.elig
+      ? `<td class="name">${r.label}${r.a.bonus ? ' <span class="tag">bonus</span>' : ""}</td>`
+      : `<td class="name" style="opacity:.35">${r.label}${r.reason ? ` <span class="tag">${r.reason}</span>` : " <span class='tag'>lieu</span>"}</td>`;
+    const forceStr = r.force > 0 ? r.force.toFixed(2) : "—";
+    return `<tr>
+      ${nameCol}
+      <td style="width:40px;${!r.elig?"opacity:.35":""}">
+        <div>${dslStr}</div>
+        <div class="bar"><div class="bar-fill" style="width:${barW}%"></div></div>
+      </td>
+      <td class="force" style="text-align:right;width:40px;${!r.elig?"opacity:.35":""}">${forceStr}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ===== reset =====
+function resetSim() {
+  simLog = [];
+  histItems = [];
+  SIM_DATE = keyOf(new Date());
+  currentPick = null;
+  document.getElementById("hist-wrap").hidden = true;
+  document.getElementById("hist").innerHTML = "";
+  document.getElementById("pick-area").hidden = true;
+  document.getElementById("empty-msg").hidden = true;
+  renderDay();
+  renderWeights();
+  document.getElementById("status").textContent = `log réinitialisé — ${activities.length} activités`;
+}
+
+// init
+renderDay();
+</script>
+</body>
+</html>
