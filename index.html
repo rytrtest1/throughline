@@ -50,12 +50,19 @@ const keyOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDat
 // debug: override the current date+time for simulation (null = real clock)
 let _debugDate = null;
 const realNow = () => _debugDate ? new Date(_debugDate) : new Date();
-const todayKey = () => keyOf(realNow());
+// the "day" for logging/caps rolls over at 9am, not midnight — Maxence is often
+// still awake past midnight and always asleep by 9am, so a midnight cutoff would
+// split one waking stretch across two calendar days. Only affects date KEYS
+// (todayKey/daysAgoKey/weekStartKey); wall-clock gates that care about the actual
+// hour (meal times, work-shift boundaries) still read realNow() directly. Decided 10/07.
+const DAY_PIVOT_HOUR = 9;
+const logicalNow = (d = realNow()) => { const x = new Date(d); x.setHours(x.getHours() - DAY_PIVOT_HOUR); return x; };
+const todayKey = () => keyOf(logicalNow());
 const stampKey = () => { const d = new Date(); return `${keyOf(d)}-${pad(d.getHours())}${pad(d.getMinutes())}`; };
 const fromKey = (s) => new Date(s + "T00:00:00");
-const daysAgoKey = (n) => { const d = realNow(); d.setDate(d.getDate() - n); return keyOf(d); };
-const weekStartKey = (d = new Date()) => {
-  const x = new Date(d); const dow = (x.getDay() + 6) % 7;
+const daysAgoKey = (n) => { const d = logicalNow(); d.setDate(d.getDate() - n); return keyOf(d); };
+const weekStartKey = (d = realNow()) => {
+  const x = logicalNow(d); const dow = (x.getDay() + 6) % 7;
   x.setDate(x.getDate() - dow); x.setHours(0, 0, 0, 0); return keyOf(x);
 };
 const daysBetween = (a, b) => Math.round((fromKey(b) - fromKey(a)) / 86400000);
@@ -109,10 +116,19 @@ const SEED = [
   A("Tidy / chore", "chore", "home", 1, [["Knock out one chore", 20]]),
 ];
 
-// ---------- engine (chapeau / checklist v5) ----------
-// pick() builds the "hat" of obligations still owed this period (day/week) and
-// draws one at random, filtered by place. Anchors (tapis, meal prep) are served
-// first, outside the draw. No scoring, no importance — being owed is binary.
+// ---------- engine (loterie proportionnelle) ----------
+// Every eligible action gets pulled into the draw with a weight = target/period
+// (a rate — e.g. 5/week → 0.71/day, 1/day → 1/day). One weighted random draw,
+// every single time. No "due" state, no calendar reset, no catch-up, no memory
+// beyond not repeating the exact previous pick. Over any long enough stretch the
+// observed frequency converges to the target ratio (law of large numbers) — but
+// no single week is guaranteed. That trade is intentional: a deterministic
+// catch-up (serve whoever's most overdue) makes the numbers exact but is "n'importe
+// quoi" to live with day to day; a pure weighted lottery is simple, matches how
+// Maxence actually thinks about it (target ⇒ share of the draws), and variance
+// around the average is an accepted cost, not a bug. Decided 09/07 — replaces the
+// old chapeau (due/calendar-reset lottery) and the counter/argmax engine (v7/v8),
+// both removed.
 
 const WORK_SUNDAY_ANCHOR = new Date(2026, 5, 7);
 function isWorkShift(d = new Date()) {
@@ -138,6 +154,7 @@ const isDone = (e) => e.type !== "skip";
 
 // --- period helpers ---
 const PERIOD = { day: 1, week: 7 };
+function periodDays(period) { return period === "day" ? 1 : 7; }
 
 function minutesInPeriod(log, actId, actionId, period) {
   const since = daysAgoKey(period === "day" ? 0 : 6);
@@ -145,13 +162,9 @@ function minutesInPeriod(log, actId, actionId, period) {
     .filter((e) => e.activityId === actId && (actionId == null || e.actionId === actionId) && e.date >= since && isDone(e))
     .reduce((s, e) => s + (e.min || 0), 0);
 }
-// --- the checklist model (v5 — "liste qui se vide") ---
-// No scores, no ranking. Each activity/action owes `target` completions per period
-// (day resets at midnight, week resets Monday). We count what's already done this
-// period; whatever still owes something is "in the hat". pick() draws one at random.
-// Once the hat is empty, it's empty — daily items refill tomorrow, weekly ones Monday.
-// No debt carries over, nothing accumulates, nothing to prioritise. The only
-// structure is the two reset clocks. Old scored engine → git + AUDIT_2026-06-22.md.
+// completionsInPeriod is informational only now (the "liste" tab progress readout,
+// x/target this period) — it does NOT gate what pick() can draw. Kept as-is since
+// the display still wants to show where you stand.
 function completionsInPeriod(log, actId, actionId, period, opts = {}) {
   const since = period === "day" ? todayKey() : weekStartKey(realNow());
   return log.filter(
@@ -159,6 +172,15 @@ function completionsInPeriod(log, actId, actionId, period, opts = {}) {
       && (!opts.requireFinish || e.finished)
       && (!opts.requireProgress || e.progressed)
   ).length;
+}
+// rolling 7-day completions, for the week-period draw cap below — deliberately NOT
+// weekStartKey (that's a calendar-Monday cliff, the exact "reset hebdo" shape tried
+// and dropped three times this summer for the creative pipelines). A rolling window
+// has no reset instant: the cap loosens by one day at a time as old sessions age out,
+// never a verdict moment (decided 10/07).
+function completionsInRollingWeek(log, actId, actionId) {
+  const since = daysAgoKey(6);
+  return log.filter((e) => e.activityId === actId && (actionId == null || e.actionId === actionId) && e.date >= since && isDone(e)).length;
 }
 
 // place filters — v4 adds where:"work" (film, work-only)
@@ -239,55 +261,35 @@ function lastLessiveWashTs(log) {
   return ts;
 }
 
-// --- soft deadlines: a ticket-weight ramp toward a moment in time, capped at
-// `maxMult` — never a guarantee like the daily anchors below, just a nudge that
-// grows the closer the deadline gets. rampHours = how far ahead it starts climbing.
-function deadlineTicketMultiplier(now, deadline, rampHours, maxMult = 8) {
-  const hoursLeft = (deadline.getTime() - now.getTime()) / 3600000;
-  if (hoursLeft <= 0) return maxMult;
-  if (hoursLeft >= rampHours) return 1;
-  const t = 1 - hoursLeft / rampHours;
-  return 1 + (maxMult - 1) * t * t;
-}
-// focaccia's deadline: the coming Wednesday 16:00 (the work week starts Thursday) — ramps over the 2 days before.
-function nextWednesday16(now) {
-  const d = new Date(now); const dow = d.getDay();
-  let add = (3 - dow + 7) % 7;
-  if (add === 0 && d.getHours() >= 16) add = 7;
-  d.setDate(d.getDate() + add); d.setHours(16, 0, 0, 0);
-  return d;
-}
-// garniture's deadline: the day after focaccia's done, capped 18:00.
-function garnitureDeadline(focacciaDateKey) {
-  const d = fromKey(focacciaDateKey); d.setDate(d.getDate() + 1); d.setHours(18, 0, 0, 0);
-  return d;
-}
-
-// --- daily anchors (tapis…): a safety net that ramps up as TIME spent in the app
-// today climbs toward ~2h, becoming the only draw once that's reached — tied to
-// usage, not the clock. A quiet no-app day just never triggers it (the point).
-const ANCHOR_TARGET_MIN = 120;
-function anchorTicketMultiplier(minutesToday, targetMin = ANCHOR_TARGET_MIN) {
-  if (minutesToday >= targetMin) return Infinity;
-  const ratio = minutesToday / targetMin;
-  return 1 + 20 * ratio * ratio;
-}
-
-// --- build the hat: every obligation not yet fulfilled for its period, filtered
-// by place, plus a handful of hand-wired gates (vaisselle needs a cooked meal
-// pending, meal-prep garniture needs focaccia first, cuisiner only at meal times,
-// plier needs a wash the day before). relax=true ignores every done/gate check so
-// "give me something anyway" still hands you a task once the hat is empty. This is
-// the single source of truth — both pick() and the sandbox "liste" view read it.
-function buildHatRows(activities, log, place, relax = false) {
-  const hat = [];
+// --- build the draw pool: every eligible action right now, weighted by its
+// rate (target ÷ period-in-days), filtered by place plus the same hand-wired
+// correctness gates as before (vaisselle needs a pending dish, garniture needs
+// focaccia first, cuisiner only at meal times, plier needs a dry wash). DAY-period
+// rows get one exception: a daily target of 1/day has a rate as high as a 5/week
+// chantier's, so without a limit the ~6 daily items structurally eat ~46% of every
+// day's draws AND can duplicate (drawn twice same day) while a chantier waits —
+// pure waste, not the accepted variance. So once a day-period row hits its target
+// for TODAY it steps out of the pool for the rest of the day, freeing its share to
+// everything else, and reopens on its own at midnight (no calendar wall, no
+// carry-over, no dry week — worst case it just closes early on one day).
+// WEEK-period rows get the same idea (added 10/07, closes the gap that let
+// always-eligible rows like Erasure blow past their target — 5/week drawing 13/week
+// in testing, because the lottery has no per-row ceiling): once its completions over
+// the rolling last 7 days reach its target it steps out, freeing its share to
+// everything else. Rolling, not weekStartKey — no Monday cliff, no reset hebdo,
+// nothing that resembles the finish/progress verdicts already retired from these
+// same pipelines. The cap just loosens a day at a time as old sessions age out.
+// relax=true skips every gate (correctness gates + both caps) — used once a normal
+// draw comes back empty because every row's gate happened to be closed.
+function buildLotteryRows(activities, log, place, relax = false) {
+  const rows = [];
   for (const a of activities) {
     if (a.kind === "task" && a.done) continue;
     if (a.kind === "pipeline" && !(a.stages || []).length) continue;
-    if (a.skipWorkDays && isWorkDayToday()) continue; // e.g. tapis: a free-day anchor, never a work day
+    if (a.skipWorkDays && isWorkDayToday()) continue; // e.g. tapis: a free-day thing, never a work day
     if (a.id === "a_vaisselle") {
       if (!placeOk(a, place)) continue;
-      if (relax || pendingVaisselleFrom(log) > 0) hat.push({ activity: a, action: a.actions[0], period: "week", target: 1, done: 0 });
+      if (relax || pendingVaisselleFrom(log) > 0) rows.push({ activity: a, action: a.actions[0], period: "week", target: 1, rate: 1 / 7 });
       continue;
     }
     const acts = a.actions || [];
@@ -308,52 +310,37 @@ function buildHatRows(activities, log, place, relax = false) {
         }
         const period = action.period || a.period || "week";
         const target = action.target || 1;
-        const done = completionsInPeriod(log, a.id, action.id, period);
-        if (relax || done < target) hat.push({ activity: a, action, period, target, done });
+        if (!relax && period === "day" && completionsInPeriod(log, a.id, action.id, period) >= target) continue;
+        if (!relax && period === "week" && completionsInRollingWeek(log, a.id, action.id) >= target) continue;
+        rows.push({ activity: a, action, period, target, rate: target / periodDays(period) });
       }
     } else {
       if (!placeOk(a, place)) continue;
       if (/\(LRU\)/.test((acts[0] || {}).text || "") && !hasDoingItems(a)) continue;
       const period = a.period || "week";
       const target = a.target || a.perWeek || 1;
-      const done = completionsInPeriod(log, a.id, null, period, { requireFinish: !!a.requireFinish, requireProgress: !!a.requireProgress });
-      if (relax || done < target) hat.push({ activity: a, action: null, period, target, done });
+      if (!relax && period === "day" && completionsInPeriod(log, a.id, null, period) >= target) continue;
+      if (!relax && period === "week" && completionsInRollingWeek(log, a.id, null) >= target) continue;
+      rows.push({ activity: a, action: null, period, target, rate: target / periodDays(period) });
     }
   }
-  return hat;
+  return rows;
 }
 
-// --- dumb pick: draw at random from what's still owed this period. Uniform,
-// except daily anchors and the two meal-prep deadlines get heavier tickets as
-// their moment approaches. The action-pickers (pipeline funnel, items LRU) only
-// shape WHAT a chosen activity proposes.
+// --- pick: one weighted random draw over the pool that's currently open (rows past
+// their day/rolling-week cap are excluded upstream by buildLotteryRows — no other
+// priority boosts). The target ratio IS the draw probability among open rows; the
+// action-pickers (pipeline funnel, items LRU) only shape WHAT a chosen activity
+// proposes. Variance below the cap is expected and accepted — what converges is
+// the average over weeks, not any single day.
 function pick(activities, log, place, options = {}) {
   const { avoidId = null, relax = false } = options;
-  const hat = buildHatRows(activities, log, place, relax).filter((h) => h.activity.id !== avoidId);
-  if (!hat.length) return null;
-  const now = realNow();
-  const isAnchorDay = (h) => (h.activity.anchor || (h.action && h.action.anchor)) && (h.action ? h.action.period || h.activity.period : h.activity.period) === "day";
-  const minutesToday = log.filter((e) => e.date >= todayKey() && isDone(e)).reduce((s, e) => s + (e.min || 0), 0);
-  const anchorMult = anchorTicketMultiplier(minutesToday);
-  const anchorsDue = hat.filter(isAnchorDay);
-  let drawn;
-  if (anchorMult === Infinity && anchorsDue.length) {
-    drawn = anchorsDue[Math.floor(Math.random() * anchorsDue.length)];
-  } else {
-    const weight = (h) => {
-      if (isAnchorDay(h)) return anchorMult;
-      if (h.action && h.action.id === "x_mp_focaccia") return deadlineTicketMultiplier(now, nextWednesday16(now), 48);
-      if (h.action && h.action.id === "x_mp_garniture") {
-        const fd = focacciaDoneDateThisWeek(log);
-        return fd ? deadlineTicketMultiplier(now, garnitureDeadline(fd), 24) : 1;
-      }
-      return 1;
-    };
-    const total = hat.reduce((s, h) => s + weight(h), 0);
-    let r = Math.random() * total;
-    drawn = hat[hat.length - 1];
-    for (const h of hat) { r -= weight(h); if (r <= 0) { drawn = h; break; } }
-  }
+  const rows = buildLotteryRows(activities, log, place, relax).filter((r) => r.activity.id !== avoidId);
+  if (!rows.length) return null;
+  const total = rows.reduce((s, r) => s + r.rate, 0);
+  let roll = Math.random() * total;
+  let drawn = rows[rows.length - 1];
+  for (const r of rows) { roll -= r.rate; if (roll <= 0) { drawn = r; break; } }
   const a = drawn.activity;
   let action = drawn.action
     ? drawn.action
@@ -371,167 +358,6 @@ function pick(activities, log, place, options = {}) {
   return action ? { activity: a, action } : null;
 }
 
-// --- engine v7 "staleston" (staleness clock) — decided 06/07, replaces the
-// broken v6. v5 (chapeau) resets every Monday, erasing dodged activities; v6
-// fixed that with a counter that never reset on the calendar — but it only
-// dropped to 0 on a chantier's COMPLETION, so an unfinished funnel (Cover…)
-// climbed forever and monopolised (Cover×9). v7 keeps the never-reset-on-clock
-// idea but resets the counter on ANY session (touch): do it → it drops to 0 and
-// recedes; ignore it → it climbs at its own rate (`target`/`period`, the field
-// v5 already reads). So a worked chantier steps back instead of cornering you,
-// and a neglected activity is auto-promoted — the self-correcting loop (faire →
-// recule, ignorer → monte), no calendar reset, no monopoly. Whichever counter is
-// highest gets proposed — argmax, no lottery. Same gates (place, meal-time,
-// focaccia-before-garniture, wash-before-plier, LRU-needs-items) as buildHatRows,
-// copied rather than shared so v5 stays byte-for-byte untouched while both run
-// side by side on the same data.
-function periodDays(period) { return period === "day" ? 1 : 7; }
-
-// last time THIS activity/action was done — the staleness reset point. ANY
-// session counts (touch-based), so a worked chantier recedes instead of
-// monopolising. null = never done, counter grows from "forever".
-function lastCounterResetTs(log, actId, actionId, opts = {}) {
-  let last = null;
-  for (const e of log) {
-    if (e.activityId !== actId) continue;
-    if (actionId != null && e.actionId !== actionId) continue;
-    if (!isDone(e)) continue;
-    if (opts.requireFinish && !e.finished) continue;
-    if (opts.requireProgress && !e.progressed) continue;
-    if (!last || e.ts > last) last = e.ts;
-  }
-  return last;
-}
-// counter units gained per day = target ÷ period-in-days (e.g. Chant 3/week →
-// 3/7 per day). Value = days-since-touch × that rate — so it crosses 1.0 right
-// on schedule, same intuition as target/period, but reset to 0 by any session
-// (touch), never by the calendar or by a completion gate.
-function counterValue(now, log, actId, actionId, target, period, opts = {}) {
-  const last = lastCounterResetTs(log, actId, actionId, opts);
-  const rate = target / periodDays(period);
-  const elapsedDays = last == null ? 999 : (now.getTime() - last) / 86400000;
-  return elapsedDays * rate;
-}
-// engine v8 "chantier chaud" — a pipeline is WARM (mid-piece) if it's been touched
-// since its last completion: the started-but-not-done state. No "fini" verdict is
-// needed to detect it — reaching the last stage (or firing the gate in sim) ends
-// warmth, a fresh touch restarts it. While warm, the chantier uses a SHORT interval
-// (warmDays) instead of its slow resting rate, so a live piece gets high exposure
-// and actually finishes — but it still resets to 0 on each touch, so it recedes and
-// never corners you. At rest (no live piece) it falls back to the slow resting rate,
-// a gentle invitation to start a new piece. Recovers v5's "finish fast" WITHOUT the
-// requireFinish completion-gate that blocks Maxence.
-const WARM_DAYS = 1; // a live chantier resurfaces on a ~1-day interval (measured sweet
-                     // spot 06/07: poèmes ~2 sem, covers/parfum/piano à parité v5, no monopoly)
-function pipelineWarm(log, a) {
-  if (a.kind !== "pipeline") return false;
-  const gate = a.requireProgress ? "progressed" : "finished";
-  let lastCompl = null, lastTouch = null;
-  for (const e of log) {
-    if (e.activityId !== a.id || !isDone(e)) continue;
-    if (!lastTouch || e.ts > lastTouch) lastTouch = e.ts;
-    if (e[gate] && (!lastCompl || e.ts > lastCompl)) lastCompl = e.ts;
-  }
-  if (lastTouch == null) return false;              // never started → rest (invite a new piece)
-  return lastCompl == null || lastTouch > lastCompl; // touched since last completion → warm
-}
-// every eligible row with its counter — no done<target filter (a counter
-// engine has no exhausted state, everything is always "in the running", just
-// at a different height). Same hand-wired gates as buildHatRows.
-function buildCounterRows(activities, log, place, relax = false, warmDays = 0) {
-  const rows = [];
-  const now = realNow();
-  for (const a of activities) {
-    if (a.kind === "task" && a.done) continue;
-    if (a.kind === "pipeline" && !(a.stages || []).length) continue;
-    if (a.skipWorkDays && isWorkDayToday()) continue; // e.g. tapis: a free-day anchor, never a work day
-    if (a.id === "a_vaisselle") {
-      if (!placeOk(a, place)) continue;
-      const pending = pendingVaisselleFrom(log);
-      if (relax || pending > 0) rows.push({ activity: a, action: a.actions[0], period: "week", target: 1, counter: pending * 999 });
-      continue;
-    }
-    const acts = a.actions || [];
-    const perActionTargets = acts.length && acts.some((x) => x.target);
-    if (perActionTargets) {
-      for (const action of acts) {
-        if (!placeOkW(action.where || a.where, place)) continue;
-        if (/\(LRU\)/.test(action.text || "") && !hasDoingItems(a)) continue;
-        if (!relax) {
-          if (action.id === "x_cu_faire" && !isMealTime(now)) continue;
-          if (action.id === "x_mp_garniture" && !focacciaDoneDateThisWeek(log)) continue;
-          if (action.id === "x_li_plier") {
-            const wts = lastLessiveWashTs(log);
-            if (!wts || now.getTime() - wts < LESSIVE_DRY_MS) continue;
-          }
-        }
-        const period = action.period || a.period || "week";
-        const target = action.target || 1;
-        const counter = counterValue(now, log, a.id, action.id, target, period);
-        rows.push({ activity: a, action, period, target, counter });
-      }
-    } else {
-      if (!placeOk(a, place)) continue;
-      if (/\(LRU\)/.test((acts[0] || {}).text || "") && !hasDoingItems(a)) continue;
-      const period = a.period || "week";
-      const target = a.target || a.perWeek || 1;
-      let counter;
-      if (warmDays && a.kind === "pipeline" && pipelineWarm(log, a)) {
-        // warm chantier: fast interval while mid-piece (v8), still touch-reset
-        const last = lastCounterResetTs(log, a.id, null);
-        const elapsedDays = last == null ? 999 : (now.getTime() - last) / 86400000;
-        counter = elapsedDays / warmDays;
-      } else {
-        counter = counterValue(now, log, a.id, null, target, period); // touch-reset (staleston): any session drops it to 0, so chantiers recede instead of monopolising
-      }
-      rows.push({ activity: a, action: null, period, target, counter });
-    }
-  }
-  return rows;
-}
-// deterministic argmax — highest counter wins. Same anchor/deadline guarantees as
-// the chapeau's pick(), ported to argmax: daily anchors (tapis…) are forced once
-// ~2h of the day is in, and below that they + the meal-prep deadlines BOOST the
-// counter (× multiplier) so they climb into winning range as their moment nears.
-function pickCounter(activities, log, place, options = {}) {
-  const { avoidId = null, relax = false, warmDays = 0 } = options;
-  const rows = buildCounterRows(activities, log, place, relax, warmDays).filter((r) => r.activity.id !== avoidId);
-  if (!rows.length) return null;
-  const now = realNow();
-  // the counter engine has no "done this period" filter (everything's always in the
-  // running), so an anchor must be excluded once done today — else the guarantee
-  // would re-force it every draw after 2h and it would monopolise the evening.
-  const owedAnchor = (r) => completionsInPeriod(log, r.activity.id, r.action ? r.action.id : null, r.period || "day") < (r.target || 1);
-  const isAnchorDay = (r) => (r.activity.anchor || (r.action && r.action.anchor)) && (r.action ? r.action.period || r.activity.period : r.activity.period) === "day" && owedAnchor(r);
-  const minutesToday = log.filter((e) => e.date >= todayKey() && isDone(e)).reduce((s, e) => s + (e.min || 0), 0);
-  const anchorMult = anchorTicketMultiplier(minutesToday);
-  const anchorsDue = rows.filter(isAnchorDay);
-  let drawn;
-  if (anchorMult === Infinity && anchorsDue.length) {
-    drawn = anchorsDue.reduce((best, r) => (r.counter > best.counter ? r : best), anchorsDue[0]); // guaranteed once ~2h is in
-  } else {
-    const boost = (r) => {
-      if (isAnchorDay(r)) return anchorMult;
-      if (r.action && r.action.id === "x_mp_focaccia") return deadlineTicketMultiplier(now, nextWednesday16(now), 48);
-      if (r.action && r.action.id === "x_mp_garniture") { const fd = focacciaDoneDateThisWeek(log); return fd ? deadlineTicketMultiplier(now, garnitureDeadline(fd), 24) : 1; }
-      return 1;
-    };
-    drawn = rows.reduce((best, r) => (r.counter * boost(r) > best.counter * boost(best) ? r : best), rows[0]);
-  }
-  const a = drawn.activity;
-  let action = drawn.action
-    ? drawn.action
-    : a.kind === "pipeline"
-      ? pipelineStep(a)
-      : hasDoingItems(a)
-        ? itemStep(a, log)
-        : a.actions[Math.floor(Math.random() * a.actions.length)];
-  if (drawn.action && action && /\(LRU\)/.test(action.text || "") && hasDoingItems(a)) {
-    action = pickItemLRU(a, log, action);
-  }
-  return { row: drawn, result: action ? { activity: a, action } : null };
-}
-
 // ---------- sandbox mode (?sim=1) ----------
 // A clone of the real app, on isolated storage, so Maxence can DRIVE the checklist
 // himself and watch it drain/refill — instead of reading a node simulator. Same
@@ -541,12 +367,15 @@ const SIM = typeof location !== "undefined" && new URLSearchParams(location.sear
 // The API key is shared (it's just a key), so pipeline advancing works in both.
 const NS = (k) => (SIM && k !== "tlx_apiKey" ? k.replace("tlx_", "tlx_sim_") : k);
 
-// buildHat = the whole checklist laid open (for the sandbox "Liste" view). Same
-// rows pick() draws from (buildHatRows), just labeled/keyed for display.
+// buildHat = the whole draw pool laid open (for the sandbox "Liste" view). Same
+// rows pick() draws from (buildLotteryRows), plus `done` (informational — how
+// many completions logged this period) and `rate` (its actual draw weight) for
+// display. Neither field affects what pick() does with the pool.
 function buildHat(activities, log, place) {
-  return buildHatRows(activities, log, place, false).map((r) => ({
+  return buildLotteryRows(activities, log, place, false).map((r) => ({
     key: r.activity.id + (r.action ? ":" + r.action.id : ""),
-    activity: r.activity, action: r.action, period: r.period, target: r.target, done: r.done,
+    activity: r.activity, action: r.action, period: r.period, target: r.target, rate: r.rate,
+    done: completionsInPeriod(log, r.activity.id, r.action ? r.action.id : null, r.period, { requireFinish: !!r.activity.requireFinish, requireProgress: !!r.activity.requireProgress }),
     label: r.action ? r.activity.name + " — " + r.action.text : r.activity.name,
   }));
 }
@@ -678,12 +507,8 @@ function Throughline() {
   const [current, setCurrent] = useState(null);
   const [lastId, setLastId] = useState(null);
   const [showWhy, setShowWhy] = useState(false);
-  // SIM-only: which engine drives propose() by hand — "hat" (v5, shipped) or
-  // "counter" (v6, candidate). Toggling is safe: both pick()/pickCounter() are
-  // pure reads over activities/log, no engine-side state to reconcile.
-  const [engine, setEngine] = useState("hat");
   const [simRes, setSimRes] = useState(null); // SIM-only: last in-app simulation result (visible, re-runnable)
-  const [simCfg, setSimCfg] = useState({ jours: 7, tirages: 10, warm: 1, band: 4 }); // editable sim conditions
+  const [simCfg, setSimCfg] = useState({ jours: 7, tirages: 10 }); // editable sim conditions
 
   // the live line. While "running", it fills from the CENTRE outward as real time
   // elapses — reaching the margins at the action's estimated minutes, then spilling
@@ -722,6 +547,9 @@ function Throughline() {
   const [simEdit, setSimEdit] = useState(null);
   const [simMin, setSimMin] = useState("");
   const [simNote, setSimNote] = useState("");
+  // sandbox-only: which list row has its target/period/where controls expanded —
+  // lets Maxence tweak the catalogue right where he tests it, no tab switch
+  const [paramEdit, setParamEdit] = useState(null);
   const [clock, setClock] = useState(0); // bump to re-render after a time jump
 
   const applyDebugTime = (day, hour) => {
@@ -824,10 +652,16 @@ function Throughline() {
   // ----- now-flow actions -----
   const propose = (logUse = log, actsUse = activities, relax = false, avoidId = null) => {
     const pl = computePlace(); setPlace(pl); // place is read from the clock, not chosen
-    const useCounter = SIM && (engine === "counter" || engine === "warm");
-    const cOpts = { relax, avoidId, ...(engine === "warm" ? { warmDays: WARM_DAYS } : {}) };
-    const raw = useCounter ? pickCounter(actsUse, logUse, pl, cOpts) : pick(actsUse, logUse, pl, { relax, avoidId });
-    const p = useCounter ? (raw && raw.result) : raw;
+    // if every row is past its day/week cap right now, don't stop — relax and redraw
+    // immediately (decided 10/07: "quand tout est arrivé à complétion, on relance
+    // juste", no stopping-point verdict to hit at the wrong moment). The "empty"
+    // stage below now only fires when there's truly nothing eligible for this place
+    // even with every gate relaxed (e.g. an empty catalogue for that context).
+    let p = pick(actsUse, logUse, pl, { relax, avoidId });
+    // the relax redraw skips every cap/gate, so without this the very thing that just
+    // hit its target could come right back — avoid at least an immediate repeat
+    // (decided 10/07, doesn't apply to the normal non-relax draw: that variance is accepted).
+    if (!p && !relax) p = pick(actsUse, logUse, pl, { relax: true, avoidId: avoidId ?? lastId });
     setShowWhy(false);
     setRunning(false); setElapsedMs(0);
     if (!p) { setCurrent(null); setStage("empty"); }
@@ -1007,7 +841,7 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
   };
 
   // section navigation — no tab bar; swipe left/right or tap the faint edge arrows.
-  const TABS = SIM ? ["now", "liste", "activities", "progress"] : ["now", "activities", "progress"];
+  const TABS = SIM ? ["now", "liste", "simulateur", "activities", "progress"] : ["now", "activities", "progress"];
   const go = (dir) => {
     const i = TABS.indexOf(tab);
     const ni = Math.min(TABS.length - 1, Math.max(0, i + dir));
@@ -1048,7 +882,6 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
       activityId: aid, actionId: current.action.id, actionText: current.action.text,
       min: minLogged, sec: minLogged * 60, domain: current.activity.domain, note: "",
       ...(current.action.itemId ? { itemId: current.action.itemId } : {}),
-      ...(SIM ? { engine } : {}), // tag which picker proposed it, so a manual sim stays attributable even if you switch mid-session
     };
     if (current.activity.kind === "task") {
       setActivities((arr) => arr.map((a) => (a.id === aid ? { ...a, done: true } : a)));
@@ -1092,7 +925,7 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
   // ----- activity mutations -----
   const upd = (id, patch) => setActivities((arr) => arr.map((a) => (a.id === id ? { ...a, ...patch } : a)));
   const addActivity = () =>
-    setActivities((arr) => [...arr, { id: uid(), name: "", domain: "creative", where: "home", perWeek: 1, kind: "practice", deadline: null, done: false, capMin: 0, capWeek: 0, actions: [{ id: uid(), text: "", min: 15 }], items: [], stages: [], note: "" }]);
+    setActivities((arr) => [...arr, { id: uid(), name: "", domain: "creative", where: "home", target: 1, period: "week", kind: "practice", deadline: null, done: false, capMin: 0, capWeek: 0, actions: [{ id: uid(), text: "", min: 15 }], items: [], stages: [], note: "" }]);
   const delActivity = (id) => setActivities((arr) => arr.filter((a) => a.id !== id));
   const addAction = (id) => upd(id, { actions: [...activities.find((a) => a.id === id).actions, { id: uid(), text: "", min: 15 }] });
   const editAction = (id, aid, patch) => upd(id, { actions: activities.find((a) => a.id === id).actions.map((ac) => (ac.id === aid ? { ...ac, ...patch } : ac)) });
@@ -1181,81 +1014,52 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
     setMsg(`✓ ${a.name} (+${m}m)`); setTimeout(() => setMsg(""), 1200);
   };
   // SIM-only week driver — plays the sandbox forward the way a human would, using
-  // the REAL shipped engine (pick = chapeau/v5, pickCounter = compteur/v6) on deep
-  // copies of the live state, so the numbers come from the engine that ships, not a
-  // re-implementation. budgetHours = session-minutes willingly spent per day; idle
-  // wall-clock time (when nothing's owed) passes but is NOT charged to the budget,
-  // so a meal-gated action can still surface later without shrinking the budget.
-  // The ONE thing a pure sim must model (no Claude in the loop to read a comment):
-  // a pipeline session advances the live piece one stage → progressed=true, and
-  // finished=true when it reaches the last stage — the same flags advanceViaClaude
-  // tags from a real comment, which the requireFinish/requireProgress gates read.
-  const simWeek = ({ engine = "hat", budgetHours = 3, days = 7, warmDays = 1.5, band = null, drawsPerDay = 0 } = {}) => {
+  // the REAL shipped engine (pick, the proportional lottery) on deep copies of the
+  // live state, so the numbers come from the engine that ships, not a
+  // re-implementation. Time is NEVER a constraint here (corrected 09/07 — an
+  // earlier version capped a work-night's home block at 60min then 4h of shift,
+  // which made 15 draws/day look like it "didn't fit" some nights; Maxence has
+  // ~10h free both at work and at home, so that ceiling was fiction). The ONLY
+  // thing that bounds a simulated day is drawsPerDay — the click count. A work
+  // day is 100% work-context, a free day 100% home-context (corrected again
+  // 09/07 — no more splitting one day into a home slice then a work slice:
+  // Maxence only engages the app at work on days he works, full stop).
+  // Pipelines are logged like any other activity here — no finished/progressed
+  // completion-rate tracking (removed 09/07: the point is session rate, advancing,
+  // not hitting a "poems finished/week" objective).
+  const simWeek = ({ days = 7, drawsPerDay = 13 } = {}) => {
     const acts = JSON.parse(JSON.stringify(activities));
     const logArr = JSON.parse(JSON.stringify(log));
     const savedDebug = _debugDate;
-    const useCounter = engine === "counter" || engine === "warm";
-    const picker = useCounter ? pickCounter : pick;
-    const pickerOpts = engine === "warm" ? { warmDays } : {};
-    const norm = (raw) => (useCounter ? raw && raw.result : raw);
 
-    const runBlock = (cur, startHour, endHour, budgetMin, maxDraws = Infinity) => {
+    const runBlock = (cur, startHour, maxDraws = Infinity, place) => {
+      const dayKey = keyOf(cur); // the simulated day, fixed — never drifts even if `now` crosses midnight
       let now = new Date(cur); now.setHours(startHour, 0, 0, 0);
-      const windowEnd = new Date(cur); windowEnd.setHours(endHour, 0, 0, 0);
-      let spent = 0, guard = 0, draws = 0;
-      while (spent < budgetMin && draws < maxDraws && now < windowEnd && guard++ < 400) {
-        _debugDate = new Date(now);
-        const pl = computePlace();
-        const p = norm(picker(acts, logArr, pl, pickerOpts));
+      let guard = 0, draws = 0;
+      while (draws < maxDraws && guard++ < 400) {
+        // gate clock: same hour/minute as `now` (meal-time / dry-time gates need the
+        // real hour), but the DATE stays pinned to dayKey. Without this, enough idle
+        // 30min hops (or a long run of draws) push `now` past midnight while dayKey
+        // stays put — todayKey() would then read the NEXT day and the day-cap gate
+        // resets mid-block, letting a day-period row (e.g. Livre) log more than once
+        // under the SAME dayKey. Found 10/07 verifying the week-cap fix.
+        _debugDate = fromKey(dayKey);
+        _debugDate.setHours(now.getHours(), now.getMinutes(), now.getSeconds(), 0);
+        const pl = place; // forced, not derived from the clock — a work day is 100% work-context, a free day 100% home
+        const p = pick(acts, logArr, pl, {});
         if (!p) { now = new Date(now.getTime() + 30 * 60000); continue; } // nothing owed → idle 30min
         const a = acts.find((x) => x.id === p.activity.id);
         const action = p.action;
         const m = a.dur || (action && (action.dur || action.min)) || 15;
         const e = {
-          id: uid(), date: keyOf(now), ts: now.getTime(), type: "done",
+          id: uid(), date: dayKey, ts: now.getTime(), type: "done",
           activityId: a.id, actionId: action ? action.id : (a.actions[0] ? a.actions[0].id : null),
           actionText: action ? action.text : (a.actions[0] ? a.actions[0].text : a.name),
           min: m, sec: m * 60, domain: a.domain, note: "",
           ...(action && action.itemId ? { itemId: action.itemId } : {}),
         };
-        if (a.kind === "pipeline") {
-          // completion cadence = how many sessions before this pipeline's gate fires,
-          // drawn fresh per completion inside a plausible band (Maxence's estimates,
-          // 08/07). This is the sim's STAND-IN for the post-session comment Claude
-          // reads in the real app — it is NOT an app parameter, it only lets a week
-          // that wasn't lived advance. Bands:
-          //   Erasure (requireFinish): 5–8 sessions → 1 finished poem
-          //   Piano   (requireProgress): 3–6 sessions → 1 réussite (a real step);
-          //           a piece graduates to repertoire after nb-stages réussites
-          //   Cover   (requireFinish): 3–5 sessions → 1 finished cover
-          //   Parfum  (requireFinish): 2–4 sessions → 1 stabilised formula
-          const BAND = { a_erasure: [5, 8], a_piano: [3, 6], a_cover: [3, 5], a_parfum_crea: [2, 4], ...(band || {}) };
-          const [lo, hi] = BAND[a.id] || [3, 5];
-          const draw = () => lo + Math.floor(Math.random() * (hi - lo + 1));
-          if (a._thresh == null) a._thresh = draw();
-          a._since = (a._since || 0) + 1;
-          if (a._since >= a._thresh) {              // a completion fires this session
-            a._since = 0; a._thresh = draw();
-            if (a.requireProgress) {                // Piano: a réussite = one real step
-              e.progressed = true;
-              const last = (a.stages || []).length - 1;
-              let it = (a.items || []).find((q) => typeof q.stage === "number" && q.stage < last);
-              if (!it) { it = { id: uid(), text: "pièce " + ((a.items || []).filter((q) => typeof q.stage === "number").length + 1), stage: 0 }; a.items.push(it); }
-              it.stage += 1;
-              if (it.stage >= last && a.graduatesTo) {   // mastered → feeds the repertoire pool
-                const tgt = acts.find((x) => x.id === a.graduatesTo);
-                if (tgt) tgt.items.push({ id: uid(), text: "pièce maîtrisée", status: "doing" });
-              }
-            } else {                                // Erasure/Cover/Parfum: whole artifact done
-              e.finished = true;
-            }
-          }
-          // non-completion sessions carry no progressed/finished flag → the gate
-          // stays unsatisfied, so the pipeline keeps resurfacing until the next
-          // completion (the "grappe autant que nécessaire tant que pas fini").
-        }
         logArr.push(e);
-        spent += m; draws += 1;
+        draws += 1;
         now = new Date(now.getTime() + m * 60000);
       }
       return draws;
@@ -1265,21 +1069,16 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
     day.setHours(0, 0, 0, 0);
     for (let d = 0; d < days; d++) {
       const cur = new Date(day); cur.setDate(cur.getDate() + d);
-      const budgetMin = Math.round(budgetHours * 60);
-      const dayCap = drawsPerDay > 0 ? drawsPerDay : Infinity; // cap total draws/day (else budget-limited)
+      const dayCap = drawsPerDay > 0 ? drawsPerDay : 13; // clicks are the only budget for a simulated day
       const workEve = isWorkShift(new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), 21, 0, 0));
       if (workEve) {
-        // work night: daytime is home (8h–20h, place=home), then the 20h shift is
-        // work. ~1h at home in the day (tapis etc.), the rest during the shift.
-        const homeMin = Math.min(budgetMin, 60);
-        const d1 = runBlock(cur, 11, 20, homeMin, dayCap);              // daytime home, spans lunch
-        runBlock(cur, 20, 24, budgetMin - homeMin, dayCap - d1);        // shift downtime, place=work
+        runBlock(cur, 20, dayCap, "work");                 // work day: 100% work-context, no home block
       } else {
-        runBlock(cur, 10, 23, budgetMin, dayCap);                      // free day: one home block spanning meals
+        runBlock(cur, 10, dayCap, "home");                 // free day: 100% home-context
       }
     }
     _debugDate = savedDebug; setClock((c) => c + 1);
-    return { app: "throughline", version: 4, engine, budgetHours, days,
+    return { app: "throughline", version: 4, days,
       exportedAt: new Date().toISOString(), activities: acts, log: logArr };
   };
 
@@ -1292,15 +1091,18 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
     setTimeout(() => setMsg(""), 1800);
   };
 
-  // SIM-only: run simWeek on the CURRENTLY selected engine and aggregate into a
-  // visible, re-runnable result. Same params every time so results are comparable:
-  // 4 weeks, ~10 draws/day, Erasure = 4 sessions/poem, averaged over 5 runs.
+  // SIM-only: run simWeek and aggregate into a visible, re-runnable result. Same
+  // params every time so results are comparable: N days, ~tirages draws/day,
+  // averaged over 5 runs. Sessions/week only — no completion-rate stat (removed
+  // 09/07, kept as a possible future idea, not a current goal: avancer > objectifs
+  // clairs). Rows split per-action for activities whose cadence lives on the
+  // action (own target), so the simulateur tab can edit the real lever either way
+  // (added 09/07 — was showing an un-editable "par action" placeholder before).
   const runSimViz = () => {
     const RUNS = 5, DAYS = Math.max(1, simCfg.jours), WEEKS = DAYS / 7;
-    const opts = { engine, days: DAYS, budgetHours: Math.max(5, simCfg.tirages), drawsPerDay: Math.max(1, simCfg.tirages), band: { a_erasure: [simCfg.band, simCfg.band] } };
-    if (engine === "warm") opts.warmDays = simCfg.warm;
-    const acc = {}, names = {};
-    let finE = 0, finC = 0, finP = 0, piano = 0, tot = 0; const drawsDays = [];
+    const opts = { days: DAYS, drawsPerDay: Math.max(1, simCfg.tirages) };
+    const acc = {}, names = {}, labels = {};
+    let tot = 0; const drawsDays = [];
     for (let r = 0; r < RUNS; r++) {
       const exp = simWeek(opts);
       (exp.activities || []).forEach((a) => { names[a.id] = a.name; });
@@ -1308,17 +1110,26 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
       tot += lg.length;
       const byDay = {}; lg.forEach((e) => { byDay[e.date] = (byDay[e.date] || 0) + 1; });
       Object.values(byDay).forEach((v) => drawsDays.push(v));
-      lg.forEach((e) => { acc[e.activityId] = (acc[e.activityId] || 0) + 1; });
-      finE += lg.filter((e) => e.activityId === "a_erasure" && e.finished).length;
-      finC += lg.filter((e) => e.activityId === "a_cover" && e.finished).length;
-      finP += lg.filter((e) => e.activityId === "a_parfum_crea" && e.finished).length;
-      piano += lg.filter((e) => e.activityId === "a_piano" && e.progressed).length;
+      lg.forEach((e) => {
+        // group by activity, unless the LIVE catalogue gives this activity's
+        // actions their own target — then group by action, so the sub-cadences
+        // that actually drive the draw can each get their own editable row
+        const act = activities.find((x) => x.id === e.activityId);
+        const ownTarget = act && act.actions.some((x) => typeof x.target === "number");
+        const key = ownTarget ? `${e.activityId}:${e.actionId}` : e.activityId;
+        acc[key] = (acc[key] || 0) + 1;
+        if (!labels[key]) {
+          labels[key] = {
+            activityId: e.activityId, actionId: ownTarget ? e.actionId : null,
+            name: ownTarget ? `${names[e.activityId] || e.activityId} — ${e.actionText}` : (names[e.activityId] || e.activityId),
+          };
+        }
+      });
     }
-    const rows = Object.keys(acc).map((id) => ({ name: names[id] || id, spw: acc[id] / RUNS / WEEKS })).sort((a, b) => b.spw - a.spw);
+    const rows = Object.keys(acc).map((key) => ({ key, ...labels[key], spw: acc[key] / RUNS / WEEKS })).sort((a, b) => b.spw - a.spw);
     const avgDraws = drawsDays.reduce((s, x) => s + x, 0) / Math.max(drawsDays.length, 1);
     setSimRes({
-      engine, drawsPerDay: +avgDraws.toFixed(1), totalPerWeek: +(tot / RUNS / WEEKS).toFixed(0), rows,
-      comp: { poemes: +(finE / RUNS / WEEKS).toFixed(2), covers: +(finC / RUNS / WEEKS).toFixed(2), parfums: +(finP / RUNS / WEEKS).toFixed(2), piano: +(piano / RUNS / WEEKS).toFixed(2) },
+      drawsPerDay: +avgDraws.toFixed(1), totalPerWeek: +(tot / RUNS / WEEKS).toFixed(0), rows,
     });
   };
 
@@ -1365,8 +1176,8 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
   useEffect(() => {
     if (!SIM) return;
     window.__tlx = {
-      stage, tab, current, activities, log, holdMs, holdDate, place, engine,
-      begin, finish, tapAction, submitComment, start, resetFlow, setEngine,
+      stage, tab, current, activities, log, holdMs, holdDate, place,
+      begin, finish, tapAction, submitComment, start, resetFlow,
       setManualMin, setComment, setTab, applyDebugTime, simWeek, simReseed,
       setLog, setActivities,
       debugNow: () => (_debugDate || new Date()).toString(),
@@ -1396,12 +1207,6 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
           <div className="mono" style={{ textAlign: "center", fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase",
             color: C.bg, background: C.bone, padding: "5px 10px", margin: "-8px -20px 14px", }}>
             bac à sable · données de test isolées · {_debugDate ? fmtLong(todayKey()) + " · " + fmtHM(_debugDate) + " · " + computePlace() : "temps réel"}
-            <div style={{ marginTop: 4 }}>
-              moteur :{" "}
-              <span onClick={() => setEngine("hat")} style={{ cursor: "pointer", textDecoration: engine === "hat" ? "underline" : "none", fontWeight: engine === "hat" ? 700 : 400 }}>chapeau (v5)</span>
-              {" / "}
-              <span onClick={() => setEngine("warm")} style={{ cursor: "pointer", textDecoration: engine === "warm" ? "underline" : "none", fontWeight: engine === "warm" ? 700 : 400 }}>chantier chaud (v8)</span>
-            </div>
           </div>
         )}
 
@@ -1434,7 +1239,7 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
 
                 {stage === "empty" && (
                   <div className="fade" style={{ fontFamily: "var(--serif)", fontSize: 20, fontWeight: 300, fontStyle: "italic", color: C.mut, lineHeight: 1.45 }}>
-                    You've done everything {place} has on the board today. That's a real day.
+                    Nothing left to draw for {place} right now.
                   </div>
                 )}
               </div>
@@ -1494,8 +1299,7 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
 
                 {stage === "empty" && (
                   <div className="fade">
-                    <button className="primary" style={{ maxWidth: 280, margin: "0 auto", display: "block" }} onClick={() => propose(log, activities, true, lastId)}>give me something anyway</button>
-                    <button className="link" style={{ marginTop: 16 }} onClick={resetFlow}>i'm done</button>
+                    <button className="link" onClick={resetFlow}>i'm done</button>
                   </div>
                 )}
 
@@ -1558,16 +1362,54 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
           const Row = (r) => {
             const remaining = r.target - r.done;
             const editing = simEdit === r.key;
+            const editingParams = paramEdit === r.key;
+            // own cadence at the action level wins (same rule as the Activities tab) —
+            // edit there instead of the activity's shared target/period
+            const ownTarget = r.action && typeof r.action.target === "number";
             return (
               <div key={r.key} style={{ borderBottom: `1px solid ${C.soft}`, padding: "9px 0" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span className="dot" style={{ background: dColor(r.activity.domain), flex: "none" }} />
                   <span style={{ flex: 1, fontSize: 14, color: C.text }}>{r.label}</span>
                   {r.target > 1 && <span className="mono" style={{ fontSize: 10, color: C.faint }}>{r.done}/{r.target}</span>}
+                  <button className="ghost" style={{ fontSize: 11 }}
+                    onClick={() => setParamEdit(editingParams ? null : r.key)}>{editingParams ? "−" : "⚙"}</button>
                   <button className="seg" onClick={() => { if (editing) { setSimEdit(null); } else { setSimEdit(r.key); setSimMin(""); setSimNote(""); } }}>
                     {editing ? "×" : "fait" + (remaining > 1 ? ` (×${remaining})` : "")}
                   </button>
                 </div>
+                {editingParams && (
+                  <div className="fade" style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, marginTop: 10, paddingLeft: 18 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input type="number" min="0" className="in mono"
+                        value={ownTarget ? r.action.target : (r.activity.target ?? 1)}
+                        onChange={(e) => {
+                          const v = Math.max(0, parseFloat(e.target.value) || 0);
+                          if (ownTarget) editAction(r.activity.id, r.action.id, { target: v });
+                          else upd(r.activity.id, { target: v });
+                        }}
+                        style={{ width: 32, fontSize: 12, textAlign: "right", borderBottom: `1px solid ${C.line}`, color: C.text }} />
+                      <div style={{ display: "flex", gap: 3 }}>
+                        {["day", "week"].map((p) => (
+                          <button key={p} className={`chip ${((ownTarget ? r.action.period : r.activity.period) || "week") === p ? "on" : ""}`}
+                            onClick={() => ownTarget ? editAction(r.activity.id, r.action.id, { period: p }) : upd(r.activity.id, { period: p })}
+                            style={{ fontSize: 10, padding: "2px 6px" }}>{p === "day" ? "/j" : "/sem"}</button>
+                        ))}
+                      </div>
+                      {ownTarget && <span className="mono" style={{ fontSize: 9, color: C.faint, fontStyle: "italic" }}>(cette action)</span>}
+                    </div>
+                    <div style={{ display: "flex", gap: 3 }}>
+                      {WHERES.map((w) => (
+                        <button key={w} className={`chip ${r.activity.where === w ? "on" : ""}`}
+                          onClick={() => upd(r.activity.id, { where: w })} style={{ fontSize: 10, padding: "2px 6px" }}>{w}</button>
+                      ))}
+                    </div>
+                    <button className="link" style={{ color: C.line, fontSize: 10 }}
+                      onClick={() => { if (window.confirm(`Supprimer "${r.activity.name}" ?`)) { delActivity(r.activity.id); setParamEdit(null); } }}>
+                      supprimer l'activité
+                    </button>
+                  </div>
+                )}
                 {editing && (
                   <div className="fade" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, paddingLeft: 18 }}>
                     <input type="number" min="1" placeholder="min" value={simMin} onChange={(e) => setSimMin(e.target.value)}
@@ -1606,100 +1448,114 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
               </div>
 
               <div className="lab" style={{ marginBottom: 4 }}>aujourd'hui · journalier</div>
-              {daily.length ? daily.map(Row) : <div className="mono" style={{ fontSize: 11, color: C.faint, padding: "8px 0 16px" }}>tout fait pour aujourd'hui — ça repousse demain</div>}
+              {daily.length ? daily.map(Row) : <div className="mono" style={{ fontSize: 11, color: C.faint, padding: "8px 0 16px" }}>cible du jour atteinte partout — reste tiré quand même, juste moins souvent</div>}
 
               <div className="lab" style={{ marginTop: 26, marginBottom: 4 }}>cette semaine · hebdo</div>
-              {weekly.length ? weekly.map(Row) : <div className="mono" style={{ fontSize: 11, color: C.faint, padding: "8px 0 16px" }}>toute la semaine faite — ça repousse lundi</div>}
+              {weekly.length ? weekly.map(Row) : <div className="mono" style={{ fontSize: 11, color: C.faint, padding: "8px 0 16px" }}>cible de la semaine atteinte partout — reste tiré quand même, juste moins souvent</div>}
 
               <div className="mono" style={{ fontSize: 10, color: C.faint, marginTop: 22, lineHeight: 1.6 }}>
-                {owed.length} cases dans le chapeau ({daily.length} jour · {weekly.length} sem) · {place} ·
-                {" "}coche → la case sort, avance le jour/la semaine pour voir la remise à zéro.
+                {owed.length} pas encore à la cible ({daily.length} jour · {weekly.length} sem) · {place} ·
+                {" "}coche → suit juste ta progression, le tirage lui reste pondéré par target/période, indifférent au "fait".
               </div>
 
               {doneRows.length > 0 && (
                 <>
                   <div className="lab" style={{ marginTop: 26, marginBottom: 8, color: C.ok }}>fait cette période ({doneRows.length})</div>
-                  {doneRows.map((r) => (
-                    <div key={r.key} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0", opacity: 0.5 }}>
-                      <span className="dot" style={{ background: dColor(r.activity.domain), flex: "none" }} />
-                      <span style={{ flex: 1, fontSize: 13, color: C.mut, textDecoration: "line-through" }}>{r.label}</span>
-                      <span className="mono" style={{ fontSize: 10, color: C.faint }}>{r.done}/{r.target}</span>
-                    </div>
-                  ))}
+                  <div style={{ opacity: 0.6 }}>{doneRows.map(Row)}</div>
                 </>
               )}
+            </div>
+          );
+        })()}
 
-              {/* --- v8 chantier-chaud comparator — same data, touch-reset, argmax
-                  instead of lottery, live chantiers on a warm (fast) interval. Read-only:
-                  doesn't affect `done`, doesn't log anything, just shows what the engine
-                  would propose right now. */}
-              {(() => {
-                const counterRows = buildCounterRows(activities, log, place, false, WARM_DAYS)
-                  .slice().sort((x, y) => y.counter - x.counter).slice(0, 8);
-                return (
-                  <>
-                    <div className="lab" style={{ marginTop: 30, marginBottom: 4, color: C.bone }}>chantier chaud (v8, comparatif) — top 8</div>
-                    <div className="mono" style={{ fontSize: 9.5, color: C.faint, marginBottom: 10 }}>
-                      recule quand touché · monte quand ignoré · chantier en cours = revient vite
-                    </div>
-                    {counterRows.map((r, i) => {
-                      const label = r.action ? r.activity.name + " — " + r.action.text : r.activity.name;
-                      return (
-                        <div key={r.activity.id + (r.action ? r.action.id : "") + i}
-                          style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0", opacity: i === 0 ? 1 : 0.65 }}>
-                          <span className="mono" style={{ fontSize: 9, color: C.faint, width: 14, flex: "none" }}>{i + 1}</span>
-                          <span className="dot" style={{ background: dColor(r.activity.domain), flex: "none" }} />
-                          <span style={{ flex: 1, fontSize: 12.5, color: i === 0 ? C.text : C.mut }}>{label}</span>
-                          <span className="mono" style={{ fontSize: 10, color: C.faint }}>{r.counter.toFixed(2)}</span>
-                        </div>
-                      );
-                    })}
-                  </>
-                );
-              })()}
+        {/* =================== SIMULATEUR (dédié — régler target/lieu et voir le résultat au même endroit) =================== */}
+        {tab === "simulateur" && SIM && (() => {
+          const max = simRes ? Math.max(...simRes.rows.map((r) => r.spw), 1) : 1;
+          return (
+            <div style={{ marginTop: 20 }}>
+              <div className="lab" style={{ marginBottom: 10, color: C.bone }}>simulateur — moteur loterie proportionnelle</div>
 
-              {/* --- in-app simulator: runs simWeek on the active engine, shows
-                  per-activity sessions/week as bars. Visible + re-runnable so the
-                  numbers aren't trusted from a hidden script. SIM-only. --- */}
-              <div className="lab" style={{ marginTop: 34, marginBottom: 6, color: C.bone }}>simulateur — 4 semaines, moteur actif</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center", marginBottom: 12 }}>
-                {[{ k: "jours", lab: "jours" }, { k: "tirages", lab: "tirages/j" }, { k: "band", lab: "séances/poème" }, ...(engine === "warm" ? [{ k: "warm", lab: "chaleur (j)" }] : [])].map(({ k, lab }) => (
+              {/* config + bouton toujours en haut, à portée de main */}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center", marginBottom: 16 }}>
+                {[{ k: "jours", lab: "jours" }, { k: "tirages", lab: "tirages/j" }].map(({ k, lab }) => (
                   <label key={k} className="mono" style={{ fontSize: 9.5, color: C.faint, display: "flex", alignItems: "center", gap: 5, letterSpacing: ".08em" }}>
-                    <input type="number" min={k === "warm" ? "0.25" : "1"} step={k === "warm" ? "0.25" : "1"} value={simCfg[k]}
+                    <input type="number" min="1" step="1" value={simCfg[k]}
                       onChange={(e) => setSimCfg((c) => ({ ...c, [k]: parseFloat(e.target.value) || c[k] }))}
                       style={{ width: 44, background: "transparent", border: "none", borderBottom: `1px solid ${C.line}`, color: C.text, fontFamily: "inherit", fontSize: 12, textAlign: "right", outline: "none", padding: "2px 4px" }} />
                     {lab}
                   </label>
                 ))}
-                <span className="mono" style={{ fontSize: 9.5, color: C.faint }}>· moyenne 5 runs</span>
+                <button className="seg on" onClick={runSimViz}>simuler</button>
               </div>
-              <button className="seg" onClick={runSimViz}>
-                simuler ({engine === "warm" ? "chantier chaud v8" : engine === "counter" ? "horloge v7" : "chapeau v5"})
-              </button>
-              {simRes && (() => {
-                const max = Math.max(...simRes.rows.map((r) => r.spw), 1);
-                const CH = ["Erasure poetry", "Cover", "Piano — pièce", "Parfum — création"];
-                return (
-                  <div style={{ marginTop: 16 }}>
-                    <div className="mono" style={{ fontSize: 10, color: C.mut, marginBottom: 14, lineHeight: 1.6 }}>
-                      {simRes.drawsPerDay} tirages/jour réels · {simRes.totalPerWeek} séances/sem<br />
-                      complétions/sem — poèmes <span style={{ color: C.bone }}>{simRes.comp.poemes}</span> · covers <span style={{ color: C.bone }}>{simRes.comp.covers}</span> · parfums <span style={{ color: C.bone }}>{simRes.comp.parfums}</span> · piano <span style={{ color: C.bone }}>{simRes.comp.piano}</span>
-                    </div>
-                    {simRes.rows.map((r) => {
-                      const isCh = CH.includes(r.name);
+
+              {!simRes ? (
+                <div className="mono" style={{ fontSize: 11, color: C.faint, padding: "10px 0" }}>appuie sur simuler pour voir la répartition</div>
+              ) : (
+                <>
+                  <div className="mono" style={{ fontSize: 10, color: C.mut, marginBottom: 14 }}>
+                    {simRes.drawsPerDay} tirages/jour réels · {simRes.totalPerWeek} séances/sem
+                  </div>
+                  {(() => {
+                    const seenActivity = new Set();
+                    return simRes.rows.map((r) => {
+                      const a = activities.find((x) => x.id === r.activityId);
+                      if (!a) return null; // supprimée depuis le dernier tirage
+                      const action = r.actionId ? a.actions.find((x) => x.id === r.actionId) : null;
+                      if (r.actionId && !action) return null; // action supprimée depuis le dernier tirage
+                      // ⚙ (lieu + suppression) s'applique à l'activité entière — un seul
+                      // panneau par activité même quand elle est éclatée en plusieurs lignes
+                      const isFirstForActivity = !seenActivity.has(a.id);
+                      seenActivity.add(a.id);
+                      const editingParams = paramEdit === a.id;
                       return (
-                        <div key={r.name} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
-                          <span style={{ width: 128, flex: "none", fontSize: 11, color: isCh ? C.bone : C.mut }}>{r.name}</span>
-                          <div style={{ flex: 1, height: 9, background: C.soft }}>
-                            <div style={{ width: `${Math.round((r.spw / max) * 100)}%`, height: 9, background: isCh ? C.bone : C.faint }} />
+                        <div key={r.key} style={{ borderBottom: `1px solid ${C.soft}`, padding: "7px 0" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <span className="dot" style={{ background: dColor(a.domain), flex: "none", opacity: action ? 0.4 : 1 }} />
+                            <span style={{ width: 148, flex: "none", fontSize: 11.5, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 4, flex: "none" }}>
+                              <input type="number" min="0" className="in mono" value={(action ? action.target : a.target) ?? 1}
+                                onChange={(e) => {
+                                  const v = Math.max(0, parseFloat(e.target.value) || 0);
+                                  if (action) editAction(a.id, action.id, { target: v }); else upd(a.id, { target: v });
+                                }}
+                                style={{ width: 26, fontSize: 11, textAlign: "right", borderBottom: `1px solid ${C.line}`, color: C.text }} />
+                              <div style={{ display: "flex", gap: 2 }}>
+                                {["day", "week"].map((p) => (
+                                  <button key={p} className={`chip ${((action ? action.period : a.period) || "week") === p ? "on" : ""}`}
+                                    onClick={() => action ? editAction(a.id, action.id, { period: p }) : upd(a.id, { period: p })}
+                                    style={{ fontSize: 9, padding: "1px 5px" }}>{p === "day" ? "/j" : "/sem"}</button>
+                                ))}
+                              </div>
+                            </div>
+                            <div style={{ flex: 1, height: 8, background: C.soft }}>
+                              <div style={{ width: `${Math.round((r.spw / max) * 100)}%`, height: 8, background: C.faint }} />
+                            </div>
+                            <span className="mono" style={{ width: 30, textAlign: "right", fontSize: 10, color: C.mut }}>{r.spw.toFixed(1)}</span>
+                            {isFirstForActivity && (
+                              <button className="ghost" style={{ fontSize: 10 }}
+                                onClick={() => setParamEdit(editingParams ? null : a.id)}>{editingParams ? "−" : "⚙"}</button>
+                            )}
                           </div>
-                          <span className="mono" style={{ width: 34, textAlign: "right", fontSize: 10, color: C.mut }}>{r.spw.toFixed(1)}</span>
+                          {editingParams && isFirstForActivity && (
+                            <div className="fade" style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, marginTop: 8, paddingLeft: 16 }}>
+                              <div style={{ display: "flex", gap: 3 }}>
+                                {WHERES.map((w) => (
+                                  <button key={w} className={`chip ${a.where === w ? "on" : ""}`}
+                                    onClick={() => upd(a.id, { where: w })} style={{ fontSize: 10, padding: "2px 6px" }}>{w}</button>
+                                ))}
+                              </div>
+                              <button className="link" style={{ color: C.line, fontSize: 10 }}
+                                onClick={() => { if (window.confirm(`Supprimer "${a.name}" ?`)) { delActivity(a.id); setParamEdit(null); } }}>
+                                supprimer l'activité
+                              </button>
+                            </div>
+                          )}
                         </div>
                       );
-                    })}
-                  </div>
-                );
-              })()}
+                    });
+                  })()}
+                </>
+              )}
             </div>
           );
         })()}
@@ -1815,10 +1671,27 @@ function ActivityCard({ a, upd, del, addAction, editAction, delAction, addStage,
             </Meta>
             {a.kind !== "task" ? (
               <>
-              <Meta label="per week">
-                <input className="in mono" type="number" min="0" value={a.perWeek}
-                  onChange={(e) => upd(a.id, { perWeek: Math.max(0, parseInt(e.target.value) || 0) })}
-                  style={{ width: 40, fontSize: 13, borderBottom: `1px solid ${C.line}`, color: C.text }} />
+              <Meta label="fréquence — target/période = poids de tirage">
+                {a.actions.some((x) => x.target) ? (
+                  <span className="mono" style={{ fontSize: 11, color: C.faint, fontStyle: "italic" }}>
+                    pilotée par action ci-dessous (ce champ est ignoré)
+                  </span>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <input className="in mono" type="number" min="0" value={a.target ?? a.perWeek ?? 1}
+                      onChange={(e) => upd(a.id, { target: Math.max(0, parseInt(e.target.value) || 0) })}
+                      style={{ width: 34, fontSize: 13, borderBottom: `1px solid ${C.line}`, color: C.text }} />
+                    <div style={{ display: "flex", gap: 4 }}>
+                      {["day", "week"].map((p) => (
+                        <button key={p} className={`chip ${(a.period || "week") === p ? "on" : ""}`}
+                          onClick={() => upd(a.id, { period: p })}>{p === "day" ? "/j" : "/sem"}</button>
+                      ))}
+                    </div>
+                    <span className="mono" style={{ fontSize: 10, color: C.faint }}>
+                      ≈ {((a.target ?? a.perWeek ?? 1) / (a.period === "day" ? 1 : 7)).toFixed(2)} poids/j
+                    </span>
+                  </div>
+                )}
               </Meta>
               <Meta label="stop after (min/day)">
                 <input className="in mono" type="number" min="0" value={a.capMin || 0}
@@ -1860,23 +1733,37 @@ function ActivityCard({ a, upd, del, addAction, editAction, delAction, addStage,
           )}
 
           {/* actions */}
-          <div className="lab" style={{ marginBottom: 10 }}>actions — what shows up · m = minutes · /wk = own weekly target (blank = shares the activity's)</div>
+          <div className="lab" style={{ marginBottom: 10 }}>actions — what shows up · m = minutes · target/période = sa propre cadence (vide = partage le poids de l'activité)</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
             {a.actions.map((ac) => (
-              <div key={ac.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div key={ac.id} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <input className="in" value={ac.text} placeholder="a concrete action"
                   onChange={(e) => editAction(a.id, ac.id, { text: e.target.value })}
-                  style={{ fontSize: 15, fontWeight: 300, fontStyle: ac.text ? "normal" : "italic", color: ac.text ? C.text : C.faint, borderBottom: `1px solid ${C.soft}`, paddingBottom: 5 }} />
+                  style={{ fontSize: 15, fontWeight: 300, fontStyle: ac.text ? "normal" : "italic", color: ac.text ? C.text : C.faint, borderBottom: `1px solid ${C.soft}`, paddingBottom: 5, flex: 1, minWidth: 120 }} />
                 <input className="in mono" type="number" min="1" value={ac.min}
                   onChange={(e) => editAction(a.id, ac.id, { min: Math.max(1, parseInt(e.target.value) || 1) })}
                   style={{ width: 34, fontSize: 12, textAlign: "right", color: C.mut }} />
                 <span className="mono" style={{ fontSize: 10, color: C.faint }}>m</span>
-                {/* optional per-action perWeek: blank → this action shares the activity's pool;
-                    a number → it's scheduled on its own rolling-7-day target (Linge, Clean…) */}
-                <input className="in mono" type="number" min="0" value={ac.perWeek ?? ""} placeholder="–"
-                  onChange={(e) => editAction(a.id, ac.id, { perWeek: e.target.value === "" ? null : Math.max(0, parseFloat(e.target.value) || 0) })}
-                  style={{ width: 30, fontSize: 12, textAlign: "right", color: typeof ac.perWeek === "number" ? C.text : C.faint }} />
-                <span className="mono" style={{ fontSize: 10, color: C.faint }}>/wk</span>
+                {/* optional per-action target/period: blank target → shares the activity's pool
+                    weight; a number → its own rate = target/period, drawn independently
+                    (Linge, Clean…) — same fields the live engine (buildLotteryRows) reads */}
+                <input className="in mono" type="number" min="0" value={ac.target ?? ""} placeholder="–"
+                  onChange={(e) => editAction(a.id, ac.id, { target: e.target.value === "" ? null : Math.max(0, parseFloat(e.target.value) || 0) })}
+                  style={{ width: 30, fontSize: 12, textAlign: "right", color: typeof ac.target === "number" ? C.text : C.faint }} />
+                {typeof ac.target === "number" && (
+                  <>
+                    <div style={{ display: "flex", gap: 3 }}>
+                      {["day", "week"].map((p) => (
+                        <button key={p} className={`chip ${(ac.period || "week") === p ? "on" : ""}`}
+                          onClick={() => editAction(a.id, ac.id, { period: p })}
+                          style={{ fontSize: 10, padding: "2px 6px" }}>{p === "day" ? "/j" : "/sem"}</button>
+                      ))}
+                    </div>
+                    <span className="mono" style={{ fontSize: 9.5, color: C.faint }}>
+                      ≈ {(ac.target / (ac.period === "day" ? 1 : 7)).toFixed(2)}/j
+                    </span>
+                  </>
+                )}
                 <button className="x" onClick={() => delAction(a.id, ac.id)}>×</button>
               </div>
             ))}
