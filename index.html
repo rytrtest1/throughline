@@ -163,6 +163,10 @@ const isOneDayBeforeWorkStretch = (d = realNow()) => {
   return !isWorkDayToday(d) && isWorkDayToday(plus(1));
 };
 const isDone = (e) => e.type !== "skip";
+// a real completion, as opposed to a free-text "note" entry (submitFreeLog) — used
+// wherever "clics" are counted (rapport gate, sandbox banners) so jotting a note
+// never inflates the count of activities actually done.
+const isClick = (e) => e.type === "done";
 // how many of the last 7 calendar days are free (not a work day) — a skipWorkDays
 // daily activity (Tapis) can never be drawn on a work day, so its true weekly
 // quota is target × free days, not target × 7 (used by domainBalance below).
@@ -1085,7 +1089,17 @@ function Throughline() {
     saveJSON(NS("tlx_hold"), { date: today, ms: next });
     propose(log, activities, false, current ? current.activity.id : null);
   };
-  const resetFlow = () => { setStage("entry"); setCurrent(null); setRunning(false); setElapsedMs(0); setPaused(false); setComment(""); setDescOpen(false); setSyncMsg(""); setSyncing(false); };
+  const resetFlow = (nextStage = "entry") => { setStage(nextStage); setCurrent(null); setRunning(false); setElapsedMs(0); setPaused(false); setComment(""); setDescOpen(false); setSyncMsg(""); setSyncing(false); };
+  // rapport: a day-close screen, unlocked only by naming it — typing "rapport" once
+  // the day's click count clears the bar (Maxence 14/07, tested as a mockup first).
+  // Reachable two ways: the after-session comment (here) and the free-log box
+  // (submitFreeLog below) — same gate, same stage, no separate mechanism.
+  const RAPPORT_MIN_CLICS = 10;
+  const finishFlow = (text) => {
+    const clicksToday = log.filter((e) => e.date === todayKey() && isClick(e)).length;
+    const rapport = clicksToday >= RAPPORT_MIN_CLICS && !!text && text.trim().toLowerCase().includes("rapport");
+    resetFlow(rapport ? "report" : "entry");
+  };
 
   // ----- after-session comment → advance the pipeline piece via a direct Claude call -----
   // The comment is the ONLY thing that moves a pipeline piece forward (no tap-to-advance).
@@ -1162,7 +1176,7 @@ Détermine où en est la pièce APRÈS cette session. new_stage = index (0 à ${
       setSyncMsg("lecture impossible (" + (err.message || "erreur") + ") — commentaire gardé");
     } finally {
       setSyncing(false);
-      setTimeout(() => { setSyncMsg(""); setComment(""); resetFlow(); }, 2400);
+      setTimeout(() => { setSyncMsg(""); finishFlow(text); }, 2400);
     }
   };
 
@@ -1212,7 +1226,7 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
       setSyncMsg("lecture impossible (" + (err.message || "erreur") + ") — commentaire gardé");
     } finally {
       setSyncing(false);
-      setTimeout(() => { setSyncMsg(""); setComment(""); resetFlow(); }, 2400);
+      setTimeout(() => { setSyncMsg(""); finishFlow(text); }, 2400);
     }
   };
 
@@ -1244,10 +1258,10 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
       const key = (await store.get("tlx_apiKey")) || "";
       if (key) { (kind === "pipeline" ? advanceViaClaude : coachViaClaude)(key, text); return; }
       setSyncMsg(kind === "pipeline" ? "pas de clé API — commentaire gardé, pièce non avancée" : "pas de clé API — commentaire gardé, note non mise à jour");
-      setTimeout(() => { setSyncMsg(""); setComment(""); resetFlow(); }, 2200);
+      setTimeout(() => { setSyncMsg(""); finishFlow(text); }, 2200);
       return;
     }
-    setComment(""); resetFlow();
+    finishFlow(text);
   };
 
   // section navigation — no tab bar; swipe left/right or tap the faint edge arrows.
@@ -1408,47 +1422,89 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
   };
   const delItem = (id, iid) => upd(id, { items: activities.find((a) => a.id === id).items.filter((it) => it.id !== iid) });
   // free-text log for anything done outside the app — one field, one Claude call
-  // resolves it against the catalogue instead of hunting for the right button.
+  // resolves the intent instead of forcing every line into an activity match.
   // Replaces the old per-activity quick-log buttons (removed with the progress tab).
+  // Three intents (Maxence 14/07 — the original version always forced "activity",
+  // even when nothing in the catalogue actually matched):
+  //   "rapport" — same door as the after-session comment, see finishFlow.
+  //   "activity" — logged exactly as before, a real "done" entry feeding the engine.
+  //   "note" — anything else, kept as-is (type: "note", no activityId) rather than
+  //   mis-matched to the nearest activity. Never counts toward "clics" (isClick).
   const submitFreeLog = async () => {
     const text = logText.trim();
     if (!text) return;
     const key = (await store.get("tlx_apiKey")) || "";
-    if (!key) { setMsg("pas de clé API — impossible de logger"); setTimeout(() => setMsg(""), 2000); return; }
+    if (!key) {
+      // no key: can't classify freely, but the "rapport" keyword alone still works
+      // (same plain match as finishFlow) — everything else is kept as a note rather
+      // than silently dropped or force-matched without any real reading of the text.
+      const clicksToday = log.filter((e) => e.date === todayKey() && isClick(e)).length;
+      if (clicksToday >= RAPPORT_MIN_CLICS && text.toLowerCase().includes("rapport")) {
+        setLogText(""); setLogOpen(false); setStage("report"); return;
+      }
+      setLog((L) => [...L, { id: uid(), date: todayKey(), ts: realNow().getTime(), type: "note", note: text }]);
+      setMsg("noté — pas de clé API pour lire plus finement"); setLogText(""); setLogOpen(false);
+      setTimeout(() => setMsg(""), 2400);
+      return;
+    }
     setLogBusy(true);
     const catalogue = activities.map((a) => {
       const acts = (a.actions || []).map((ac) => `${ac.id}: ${ac.text}`).join(" · ") || "(pas d'action fixe)";
       return `${a.id} — ${a.name} (${a.domain}) : ${acts}`;
     }).join("\n");
-    const prompt = `Tu identifies quelle activité du catalogue correspond à ce que Maxence vient de faire hors de l'app, pour la logger.
+    const prompt = `Tu lis ce que Maxence vient de taper dans la case "log" de throughline, et tu détermines son intention.
 
 Catalogue (id — nom (domaine) : actions[id: texte]) :
 ${catalogue}
 
-Ce qu'il a fait, en ses mots :
+Ce qu'il a tapé :
 « ${text} »
 
-Réponds avec : activity_id = l'id exact du catalogue qui correspond le mieux. action_id = l'id de l'action qui correspond (omets-le si aucune ne colle, l'activité seule suffit). min = durée en minutes (déduite du texte, estimation raisonnable si non précisée). note = une ligne qui résume ce qui a été fait.`;
+Détermine intent :
+- "rapport" si le texte demande un bilan/rapport de sa journée (le mot "rapport" ou un équivalent explicite).
+- "activity" si le texte décrit clairement une activité qu'il vient de faire ET qui correspond à une ligne précise du catalogue.
+- "note" pour tout le reste — une pensée, un fait à garder, quelque chose de flou ou qui ne colle à aucune activité précise. Ne force JAMAIS un match approximatif : dans le doute, "note".
+
+Si intent = "activity" : activity_id = l'id exact du catalogue qui correspond le mieux. action_id = l'id de l'action qui correspond (omets-le si aucune ne colle). min = durée en minutes déduite du texte, estimation raisonnable si non précisée.
+note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de commentaire loggé).`;
     try {
       const out = await claudeJSON(key, prompt, {
         type: "object",
-        properties: { activity_id: { type: "string" }, action_id: { type: "string" }, min: { type: "integer" }, note: { type: "string" } },
-        required: ["activity_id", "min", "note"],
+        properties: {
+          intent: { type: "string", enum: ["rapport", "activity", "note"] },
+          activity_id: { type: "string" }, action_id: { type: "string" },
+          min: { type: "integer" }, note: { type: "string" },
+        },
+        required: ["intent", "note"],
         additionalProperties: false,
       }, 300);
-      const a = activities.find((x) => x.id === out.activity_id);
-      if (!a) throw new Error("activité non reconnue");
-      const action = out.action_id ? (a.actions || []).find((x) => x.id === out.action_id) : null;
-      const m = Math.max(1, Math.round(out.min) || 15);
-      const e = {
-        id: uid(), date: todayKey(), ts: realNow().getTime(), type: "done",
-        activityId: a.id, actionId: action ? action.id : null,
-        actionText: action ? action.text : a.name,
-        min: m, sec: m * 60, domain: a.domain, note: out.note || text,
-      };
-      if (a.kind === "task") setActivities((arr) => arr.map((x) => (x.id === a.id ? { ...x, done: true } : x)));
-      setLog((L) => [...L, e]);
-      setMsg(`logged: ${e.actionText}`); setLogText(""); setLogOpen(false);
+
+      if (out.intent === "rapport") {
+        const clicksToday = log.filter((e) => e.date === todayKey() && isClick(e)).length;
+        if (clicksToday >= RAPPORT_MIN_CLICS) setStage("report");
+        else setMsg(`pas encore ${RAPPORT_MIN_CLICS} clics aujourd'hui (${clicksToday})`);
+        setLogText(""); setLogOpen(false);
+        return;
+      }
+
+      const a = out.intent === "activity" ? activities.find((x) => x.id === out.activity_id) : null;
+      if (a) {
+        const action = out.action_id ? (a.actions || []).find((x) => x.id === out.action_id) : null;
+        const m = Math.max(1, Math.round(out.min) || 15);
+        const e = {
+          id: uid(), date: todayKey(), ts: realNow().getTime(), type: "done",
+          activityId: a.id, actionId: action ? action.id : null,
+          actionText: action ? action.text : a.name,
+          min: m, sec: m * 60, domain: a.domain, note: out.note || text,
+        };
+        if (a.kind === "task") setActivities((arr) => arr.map((x) => (x.id === a.id ? { ...x, done: true } : x)));
+        setLog((L) => [...L, e]);
+        setMsg(`logged: ${e.actionText}`);
+      } else {
+        setLog((L) => [...L, { id: uid(), date: todayKey(), ts: realNow().getTime(), type: "note", note: out.note || text }]);
+        setMsg("noté");
+      }
+      setLogText(""); setLogOpen(false);
     } catch (err) {
       setMsg("lecture impossible (" + (err.message || "erreur") + ")");
     } finally {
@@ -1687,6 +1743,57 @@ Réponds avec : activity_id = l'id exact du catalogue qui correspond le mieux. a
     <div className="tl"><style dangerouslySetInnerHTML={{ __html: css }} /><div className="grain" /><div className="wrap"><span className="lab">loading…</span></div></div>
   );
 
+  // rapport screen: full takeover of "the line", same spirit as "empty" — no tab, no
+  // chrome, just the day's activities (chronological, LRU items already carry their
+  // own label via actionText) and any comment left, as a quote. Closing goes back to
+  // the live line via resetFlow(), same door as everywhere else.
+  if (stage === "report") {
+    // real completions only (isClick) for the list/count/min — a free-log "note"
+    // entry (submitFreeLog) isn't an activity done, it shouldn't pad either. Quotes
+    // pull from every non-skip entry with a comment though, standalone notes included.
+    const todayAll = log.filter((e) => e.date === todayKey() && isDone(e)).sort((a, b) => a.ts - b.ts);
+    const todayLog = todayAll.filter(isClick);
+    const totalMin = todayLog.reduce((s, e) => s + (e.min || 0), 0);
+    const quotes = todayAll.filter((e) => e.note && e.note.trim());
+    return (
+      <div className="tl">
+        <style dangerouslySetInnerHTML={{ __html: css }} />
+        <div className="grain" />
+        <div className="wrap" style={{ minHeight: "100vh", padding: "40px 20px", display: "flex", flexDirection: "column" }}>
+          <div className="mono" style={{ fontSize: 10, letterSpacing: ".22em", textTransform: "uppercase", color: C.faint, marginBottom: 24 }}>
+            rapport · {fmtLong(todayKey())}
+          </div>
+          <div className="mono" style={{ fontSize: 13, color: C.mut, marginBottom: 28 }}>
+            {todayLog.length} clics · {totalMin} min
+          </div>
+          <div style={{ marginBottom: quotes.length ? 30 : 0 }}>
+            {todayLog.map((e) => (
+              <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 10, borderBottom: `1px solid ${C.soft}`, padding: "9px 0" }}>
+                <span className="dot" style={{ background: C.mut, flex: "none" }} />
+                <span style={{ flex: 1, fontSize: 14, color: C.text, textTransform: "lowercase" }}>{e.actionText}</span>
+                <span className="mono" style={{ fontSize: 11, color: C.faint }}>{e.min} min</span>
+              </div>
+            ))}
+          </div>
+          {quotes.length > 0 && (
+            <div style={{ marginBottom: 30 }}>
+              <div className="mono" style={{ fontSize: 10, letterSpacing: ".14em", textTransform: "uppercase", color: C.faint, marginBottom: 14 }}>moments</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                {quotes.map((e) => (
+                  <div key={e.id}>
+                    <div style={{ fontFamily: "var(--serif)", fontStyle: "italic", fontWeight: 300, fontSize: 14, color: C.text, lineHeight: 1.5 }}>« {e.note.trim()} »</div>
+                    <div className="mono" style={{ fontSize: 9.5, color: C.faint, marginTop: 5, letterSpacing: ".08em", textTransform: "uppercase" }}>{e.actionText || "note libre"}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <button className="link" style={{ alignSelf: "center", marginTop: "auto" }} onClick={() => resetFlow()}>fermer</button>
+        </div>
+      </div>
+    );
+  }
+
   // live line geometry. For timed activities: fills toward the period target (e.g. 30 min/day).
   // For binary: fills toward dur (session feel). >1 = went beyond — tant mieux.
   const actDurMin = current?.activity?.timed
@@ -1707,7 +1814,7 @@ Réponds avec : activity_id = l'id exact du catalogue qui correspond le mieux. a
             color: C.bg, background: C.bone, padding: "5px 10px", margin: "-8px -20px 14px",
             display: "flex", justifyContent: "center", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <div style={{ width: "100%", display: "flex", justifyContent: "center", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span>bac à sable · {fmtLong(todayKey())} · {fmtHM(realNow())} · {computePlace()} · {log.filter((e) => e.date === todayKey() && isDone(e)).length} clics</span>
+              <span>bac à sable · {fmtLong(todayKey())} · {fmtHM(realNow())} · {computePlace()} · {log.filter((e) => e.date === todayKey() && isClick(e)).length} clics</span>
             </div>
             {/* time controls, same actions as the "liste" tab's clock block, surfaced
                 here too (added 10/07) so a hand-run week never needs a tab switch just
@@ -1980,7 +2087,7 @@ Réponds avec : activity_id = l'id exact du catalogue qui correspond le mieux. a
               <div className="mono" style={{ textAlign: "center", fontSize: 13, color: C.bone, letterSpacing: ".06em", marginBottom: 4 }}>
                 {fmtLong(todayKey())} · {fmtHM(realNow())}
               </div>
-              <div className="mono" style={{ textAlign: "center", fontSize: 9.5, color: C.faint, marginBottom: 14 }}>lieu : {place} · {log.filter((e) => e.date === todayKey() && isDone(e)).length} clics aujourd'hui</div>
+              <div className="mono" style={{ textAlign: "center", fontSize: 9.5, color: C.faint, marginBottom: 14 }}>lieu : {place} · {log.filter((e) => e.date === todayKey() && isClick(e)).length} clics aujourd'hui</div>
 
               {/* pause — advance the clock without doing anything, to feel time between actions */}
               <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
@@ -2092,8 +2199,22 @@ Réponds avec : activity_id = l'id exact du catalogue qui correspond le mieux. a
             <label className="link" style={{ cursor: "pointer" }}>load
               <input type="file" accept="application/json,.json,text/plain,.txt" onChange={onFile} style={{ display: "none" }} />
             </label>
-            <button className="link" onClick={() => setKeyOpen((o) => !o)}>key{apiKey ? " ·" : ""}</button>
+          </div>
+          <div style={{ marginTop: 14 }}>
             <button className="link" onClick={() => setLogOpen((o) => !o)}>log</button>
+          </div>
+          {logOpen && (
+            <div style={{ marginTop: 18, maxWidth: 320, marginLeft: "auto", marginRight: "auto" }}>
+              <input className="in" value={logText} placeholder="qu'as-tu fait ?"
+                onChange={(e) => setLogText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") submitFreeLog(); }}
+                disabled={logBusy}
+                style={{ fontSize: 14, textAlign: "center", borderBottom: `1px solid ${C.line}`, paddingBottom: 8, fontStyle: logText ? "normal" : "italic", color: logText ? C.text : C.faint }} />
+              {logBusy && <div className="mono" style={{ fontSize: 10, color: C.faint, marginTop: 10 }}>…</div>}
+            </div>
+          )}
+          <div style={{ marginTop: 14 }}>
+            <button className="link" onClick={() => setKeyOpen((o) => !o)}>key{apiKey ? " ·" : ""}</button>
           </div>
           {keyOpen && (
             <div style={{ marginTop: 18, maxWidth: 320, marginLeft: "auto", marginRight: "auto" }}>
@@ -2107,16 +2228,6 @@ Réponds avec : activity_id = l'id exact du catalogue qui correspond le mieux. a
               <div className="mono" style={{ fontSize: 9, color: C.faint, marginTop: 10, lineHeight: 1.6 }}>
                 stored only on this device — never committed. reads your after-session comments to advance the funnel; sent only to anthropic.
               </div>
-            </div>
-          )}
-          {logOpen && (
-            <div style={{ marginTop: 18, maxWidth: 320, marginLeft: "auto", marginRight: "auto" }}>
-              <input className="in" value={logText} placeholder="qu'as-tu fait ?"
-                onChange={(e) => setLogText(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") submitFreeLog(); }}
-                disabled={logBusy}
-                style={{ fontSize: 14, textAlign: "center", borderBottom: `1px solid ${C.line}`, paddingBottom: 8, fontStyle: logText ? "normal" : "italic", color: logText ? C.text : C.faint }} />
-              {logBusy && <div className="mono" style={{ fontSize: 10, color: C.faint, marginTop: 10 }}>…</div>}
             </div>
           )}
           <div style={{ marginTop: 22, textAlign: "center" }}>
