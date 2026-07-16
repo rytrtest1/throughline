@@ -842,12 +842,6 @@ const css = `
 .navarr:hover{color:${C.mut}}
 .breathe{animation:breathe 3.6s ease-in-out infinite}
 @keyframes breathe{0%,100%{opacity:.4}50%{opacity:.95}}
-.sway{animation:sway 5.2s ease-in-out infinite}
-@keyframes sway{0%,100%{transform:rotate(calc(-1 * var(--tilt-amp,0deg)))}50%{transform:rotate(var(--tilt-amp,0deg))}}
-/* lets --tilt-amp be transitioned as a real angle instead of jumping instantly —
-   needed so the settle (amplitude eased down to 0 while "sway" keeps running,
-   see startBalanceReveal) damps smoothly instead of snapping at the end. */
-@property --tilt-amp{syntax:'<angle>';inherits:false;initial-value:0deg}
 .link{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:${C.faint};background:none;border:none;cursor:pointer;transition:color .2s}
 .link:hover{color:${C.mut}}
 textarea.in{resize:vertical}
@@ -857,7 +851,7 @@ textarea.in{resize:vertical}
 input[type=range].sl{-webkit-appearance:none;appearance:none;height:2px;background:${C.line};outline:none;width:100%;margin:0}
 input[type=range].sl::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:${C.bone};cursor:pointer}
 input[type=range].sl::-moz-range-thumb{width:16px;height:16px;border:none;border-radius:50%;background:${C.bone};cursor:pointer}
-@media (prefers-reduced-motion:reduce){.fade{animation:none;opacity:1;transform:none}.breathe{animation:none;opacity:.7}.sway{animation:none;transform:none}}
+@media (prefers-reduced-motion:reduce){.fade{animation:none;opacity:1;transform:none}.breathe{animation:none;opacity:.7}}
 `;
 
 function Throughline() {
@@ -992,28 +986,61 @@ function Throughline() {
   // the line is back at rest). A shake mid-reveal is ignored so the settle
   // always finishes.
   const [balanceVisible, setBalanceVisible] = useState(false);
-  const [swaySettling, setSwaySettling] = useState(false);
+  const [swaySettling, setSwaySettling] = useState(false); // only drives the click-counter's own opacity fade
   const revealActiveRef = useRef(false);
-  const settleTimersRef = useRef([]);
+  const lineRef = useRef(null); // the swaying div — tilt is driven on it directly, not through React state
+  const rafRef = useRef(null);
   const SWAY_MS = 4200; // how long it actively sways before starting to calm down
   const SETTLE_MS = 1100; // the ease back to flat, mirrors a physical settle
 
+  // 16/07: rewritten after the CSS-animation→CSS-transition handoff (removing the
+  // "sway" class mid-swing while starting a transition to rotate(0)) kept producing a
+  // perceptible snap — the browser doesn't reliably pick up the animation's exact
+  // current angle as the transition's start point. Driving the angle every frame from
+  // a single continuous function of elapsed time removes that handoff entirely: the
+  // oscillation (sin) never stops or resets, only its envelope eases from 1 to 0 with
+  // a smoothstep (zero velocity at both ends), so there is no instant in the whole
+  // reveal where the angle's rate of change jumps.
   const startBalanceReveal = () => {
+    cancelAnimationFrame(rafRef.current);
     revealActiveRef.current = true;
-    settleTimersRef.current.forEach(clearTimeout);
     setSwaySettling(false);
     setBalanceVisible(true);
-    settleTimersRef.current = [setTimeout(() => {
-      setSwaySettling(true); // swap the infinite sway for a single ease back to rotate(0)
-      settleTimersRef.current.push(setTimeout(() => {
+    const startedAt = performance.now();
+    const spread = domainBalance(activities, log); // frozen for this reveal, not recomputed per frame
+    const ampDeg = spread * 6;
+    const periodMs = (7 - spread * 3.5) * 1000;
+    const totalMs = SWAY_MS + SETTLE_MS;
+    const smoothstep = (x) => x * x * (3 - 2 * x);
+    let settlingFlagged = false;
+    const tick = (now) => {
+      const elapsed = now - startedAt;
+      if (elapsed >= totalMs) {
+        if (lineRef.current) lineRef.current.style.transform = "";
         setBalanceVisible(false);
         setSwaySettling(false);
         revealActiveRef.current = false;
-      }, SETTLE_MS));
-    }, SWAY_MS)];
+        return;
+      }
+      if (!settlingFlagged && elapsed >= SWAY_MS) { settlingFlagged = true; setSwaySettling(true); }
+      const envelope = elapsed <= SWAY_MS ? 1 : 1 - smoothstep(Math.min(1, (elapsed - SWAY_MS) / SETTLE_MS));
+      const angle = ampDeg * Math.sin((2 * Math.PI * elapsed) / periodMs) * envelope;
+      if (lineRef.current) lineRef.current.style.transform = `rotate(${angle}deg)`;
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
   };
 
-  useEffect(() => () => settleTimersRef.current.forEach(clearTimeout), []);
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+
+  // the devicemotion listener below is registered once (empty deps) so it isn't
+  // torn down/re-added on every render, but that means its closure would otherwise
+  // freeze startBalanceReveal (and the activities/log it reads) at mount time —
+  // caught 16/07 via testing: shakes kept using empty/default data from before the
+  // catalogue even loaded. Routing the call through a ref that's reassigned every
+  // render keeps it current without re-subscribing the listener.
+  const startBalanceRevealRef = useRef(() => {});
+  startBalanceRevealRef.current = startBalanceReveal;
 
   useEffect(() => {
     if (typeof window === "undefined" || !window.DeviceMotionEvent) return;
@@ -1028,7 +1055,7 @@ function Throughline() {
         const now = Date.now();
         if (Math.abs(mag - lastMag) > SHAKE_DELTA && now - lastShakeTs > COOLDOWN_MS && !revealActiveRef.current) {
           lastShakeTs = now;
-          startBalanceReveal();
+          startBalanceRevealRef.current();
         }
       }
       lastMag = mag;
@@ -2158,26 +2185,16 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
                 // with a parameter. Motion carries the signal, a static lean read as a glitch.
                 // Hidden by default (zero footprint) — a shake reveals it, then it settles
                 // back to flat on its own (see startBalanceReveal above).
-                const balanceSpread = balanceVisible ? domainBalance(activities, log) : 0;
-                const tiltAmpDeg = balanceSpread * 6;
-                const swayDurationSec = 7 - balanceSpread * 3.5;
-                // settle without a snap: the "sway" keyframe animation stays running the
-                // whole time (transform is never handed off between animation and
-                // transition — that handoff is what caused the jump at the end). Only the
-                // --tilt-amp amplitude it reads eases down to 0deg, damping the swing to
-                // nothing in place, like a real pendulum losing energy rather than being
-                // stopped by a wall.
+                // the tilt itself is driven imperatively frame-by-frame on lineRef (see
+                // startBalanceReveal) — a continuous sin(elapsed) whose envelope eases to
+                // 0, so there's no React re-render in the loop and no animation/transition
+                // handoff to snap.
                 return (
-                  <div className={balanceVisible ? "sway" : ""} onPointerDown={onLineDown} onPointerUp={onLineUp} onPointerLeave={onLineCancel} onPointerCancel={onLineCancel}
+                  <div ref={lineRef} onPointerDown={onLineDown} onPointerUp={onLineUp} onPointerLeave={onLineCancel} onPointerCancel={onLineCancel}
                     onContextMenu={(e) => e.preventDefault()}
                     style={{ position: "relative", height: 44, width: "82%", margin: "0 auto",
                       display: "flex", justifyContent: "center", alignItems: "center",
-                      overflow: "visible", cursor: "pointer", touchAction: "manipulation", userSelect: "none", WebkitUserSelect: "none",
-                      ...(balanceVisible ? {
-                        "--tilt-amp": `${swaySettling ? 0 : tiltAmpDeg}deg`,
-                        animationDuration: `${swayDurationSec}s`,
-                        ...(swaySettling ? { transitionProperty: "--tilt-amp", transitionDuration: `${SETTLE_MS}ms`, transitionTimingFunction: "ease-out" } : {}),
-                      } : {}) }}>
+                      overflow: "visible", cursor: "pointer", touchAction: "manipulation", userSelect: "none", WebkitUserSelect: "none" }}>
                     {/* hollow track — inset, never touches the edges */}
                     <div className={stage === "entry" && !holding ? "breathe" : ""}
                       style={{ position: "absolute", left: 0, right: 0, top: "50%", height: 2, background: stage === "entry" ? C.bone : C.soft,
