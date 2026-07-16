@@ -1517,6 +1517,22 @@ Réécris la note en y intégrant ce qu'apporte ce commentaire — garde ce qui 
     finishFlow(text);
   };
 
+  // mid-session comment (Maxence 16/07, round 8): Enter while running logs the
+  // thought right away and clears the field, so several can go out over one
+  // session — same "note" shape as the album titles (isDone/isClick skip it, it's
+  // not a completion). Ending the session is still only the line tap (finish());
+  // the field stays open afterward on "done" for a last word, untouched by this.
+  const submitRunningComment = () => {
+    const text = comment.trim();
+    if (!text || !current) return;
+    setLog((L) => [...L, {
+      id: uid(), date: todayKey(), ts: realNow().getTime(), type: "note",
+      activityId: current.activity.id, actionId: current.action.id, actionText: current.action.text,
+      note: text,
+    }]);
+    setComment("");
+  };
+
   // section navigation — no tab bar; swipe left/right or tap the faint edge arrows.
   // prod is a single screen — the line. The activities editor lives in the sandbox
   // only now (13/07); the catalogue is edited in the files directly, not in-app.
@@ -2469,6 +2485,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
                     <div style={{ position: "relative", maxWidth: 320, margin: "54px auto 0" }}>
                       <input className="in" value={comment}
                         onChange={(e) => setComment(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") submitRunningComment(); }}
                         style={{ fontFamily: "var(--mono)", fontSize: 13, textAlign: "center", display: "block", color: C.text }} />
                       {!comment && (
                         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: COMMENT_HINT_MODE === "cursor" ? "flex-start" : "center", justifyContent: "center", gap: 6, pointerEvents: "none", fontFamily: "var(--mono)", fontSize: 13, color: C.faint }}>
