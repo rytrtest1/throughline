@@ -1016,6 +1016,9 @@ function Throughline() {
   const [reportIdx, setReportIdx] = useState(0);
   const [reportPhase, setReportPhase] = useState("playing"); // "playing" | "interactive"
   const reportTouchRef = useRef(null);
+  // grid layout (post-playback): which activities' comments are toggled open —
+  // closed by default, tap a row to reveal/hide (Maxence 17/07).
+  const [reportExpanded, setReportExpanded] = useState(() => new Set());
   // hold-the-line to leave the rapport — same control-surface language as the "now"
   // line (short tap acts, long hold retracts) rather than a separate button.
   const [reportHolding, setReportHolding] = useState(false);
@@ -1199,6 +1202,7 @@ function Throughline() {
     if (stage !== "report") { setBestOf(null); return; }
     setReportIdx(0);
     setReportPhase("playing");
+    setReportExpanded(new Set());
     const todayAll = log.filter((e) => e.date === todayKey() && isDone(e));
     const withNotes = todayAll.filter((e) => e.note && e.note.trim());
     if (withNotes.length <= 3) { setBestOf(withNotes.map((e) => e.id)); return; }
@@ -2250,6 +2254,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
       albumTitles, albumIdx, setAlbumTitles, setAlbumIdx, advanceAlbumTitle,
       rating, setRating, setRatingFromPointer,
       reportIdx, reportPhase, setReportIdx, setReportPhase,
+      reportExpanded, setReportExpanded,
       debugNow: () => (_debugDate || new Date()).toString(),
     };
   });
@@ -2258,12 +2263,20 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
     <div className="tl"><style dangerouslySetInnerHTML={{ __html: css }} /><div className="grain" /><div className="wrap"><span className="lab">loading…</span></div></div>
   );
 
+  // interactive layout once playback has run through: "grid" (default) is the
+  // decuple design Maxence asked for on 17/07 — the single line splits into one row
+  // per activity, stacked vertically, title above each, tap a row to reveal/hide its
+  // comment. "spotlight" is the earlier swipe/dots single-focus design (14/07, see
+  // memory throughline-rapport-screen 1c/1e) — kept in the code rather than deleted,
+  // flip this constant back to "spotlight" to restore it, nothing else to undo.
+  const REPORT_END_LAYOUT = "grid"; // "grid" | "spotlight"
+
   // rapport screen: full takeover of "the line", same spirit as "empty" — no tab, no
   // chrome. Plays back the day's activities one at a time (name in the same spot the
   // "now" tab uses, line filling as % of the day's total time, a short summary of the
-  // linked comment when there is one worth surfacing), then hands over to swipe/dots
-  // so any activity — and its full comment — can be revisited. Closing goes back to
-  // the live line via resetFlow(), same door as everywhere else.
+  // linked comment when there is one worth surfacing), then hands over to the
+  // REPORT_END_LAYOUT so any activity — and its full comment — can be revisited.
+  // Closing goes back to the live line via resetFlow(), same door as everywhere else.
   if (stage === "report") {
     // real completions only (isClick) — a free-log "note" entry (submitFreeLog) isn't
     // an activity done, it shouldn't take a share of the line.
@@ -2308,8 +2321,18 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
       }
     };
 
-    // hold the line ~2s to leave — same "the line is the whole control surface"
-    // language as the "now" tab, no separate "fermer" button needed.
+    // grid rows: tap toggles that activity's comment open/closed — closed by default,
+    // independent per row (several can be open at once).
+    const toggleReportExpanded = (id) => setReportExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+    // hold anywhere on the report body ~2s to leave — same "the line is the whole
+    // control surface" language as the "now" tab, no separate "fermer" button needed.
+    // Lives on the outer content wrapper (not just the line) so it still works once
+    // the line has decupled into the grid.
     const REPORT_HOLD_MS = 2000;
     const onReportLineDown = () => {
       reportDidHold.current = false;
@@ -2340,77 +2363,126 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
             </div>
           </div>
 
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+          <div onPointerDown={onReportLineDown} onPointerUp={cancelReportHold} onPointerLeave={cancelReportHold} onPointerCancel={cancelReportHold}
+            onContextMenu={(e) => e.preventDefault()}
+            style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center",
+              cursor: "pointer", touchAction: "manipulation", userSelect: "none", WebkitUserSelect: "none",
+              transform: `scaleX(${reportHolding ? 0 : 1})`, transformOrigin: "center",
+              transition: reportHolding ? `transform ${REPORT_HOLD_MS}ms linear` : "transform .3s cubic-bezier(.2,.7,.2,1)" }}>
 
-            {/* activity name — same spot/style as the "now" tab's hero label, one at a time */}
-            <div style={{ minHeight: 24, textAlign: "center", marginBottom: 24 }}>
-              {cur && (
-                <div key={`n${idx}`} className="fade mono" style={{ fontSize: 10, letterSpacing: ".22em", textTransform: "uppercase", color: C.faint }}>
-                  {cur.e.actionText}
-                </div>
-              )}
-            </div>
+            {/* activity name — same spot/style as the "now" tab's hero label, one at a
+                time. Once handed over to the grid layout, each row carries its own
+                title instead, so this hero slot is playback-only (or spotlight nav). */}
+            {(playing || REPORT_END_LAYOUT === "spotlight") && (
+              <div style={{ minHeight: 24, textAlign: "center", marginBottom: 24 }}>
+                {cur && (
+                  <div key={`n${idx}`} className="fade mono" style={{ fontSize: 10, letterSpacing: ".22em", textTransform: "uppercase", color: C.faint }}>
+                    {cur.e.actionText}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* the line: same track, but stacked into the day's segments — each fades
                 in as playback reaches it, so the bar visibly fills as % of the day's
-                total time instead of appearing all at once. Also the exit control:
-                holding it ~2s collapses the whole line toward the centre and returns
-                to "now", same felt gesture as the live line's hold-to-retract. */}
-            <div onPointerDown={onReportLineDown} onPointerUp={cancelReportHold} onPointerLeave={cancelReportHold} onPointerCancel={cancelReportHold}
-              onContextMenu={(e) => e.preventDefault()}
-              style={{ position: "relative", height: 44, width: "82%", margin: "0 auto", display: "flex", alignItems: "center",
-                cursor: "pointer", touchAction: "manipulation", userSelect: "none", WebkitUserSelect: "none",
-                transform: `scaleX(${reportHolding ? 0 : 1})`, transformOrigin: "center",
-                transition: reportHolding ? `transform ${REPORT_HOLD_MS}ms linear` : "transform .3s cubic-bezier(.2,.7,.2,1)" }}>
-              <div style={{ position: "absolute", left: 0, right: 0, top: "50%", height: 2, background: C.soft, transform: "translateY(-50%)" }} />
-              <div style={{ position: "absolute", left: 0, right: 0, top: 0, height: 3,
-                transform: `translateX(${groupOffsetPct}%)`, transition: "transform .5s cubic-bezier(.2,.7,.2,1)" }}>
-                {segs.map((s, i) => {
-                  // once handed over, the whole day stays filled — only which segment is
-                  // focused moves; only during playback does reveal itself track idx.
-                  // during playback each segment also grows in turn, from its own centre
-                  // out to full size, layered on top of the group's own centre-outward
-                  // spread. Handing over to navigation replicates the same motion: only
-                  // the focused segment is grown, everything else collapses to its centre.
-                  const active = playing ? i <= idx : i === idx;
-                  return (
-                    <div key={s.e.id} onClick={() => !playing && setReportIdx(i)}
-                      style={{
-                        position: "absolute", left: `${s.leftPct}%`, width: `${s.wPct}%`, top: 0, height: 3, borderRadius: 1,
-                        background: C.bone, cursor: playing ? "default" : "pointer",
-                        opacity: active ? 0.9 : 0,
-                        transform: `scaleX(${active ? 1 : 0})`, transformOrigin: "center",
-                        boxShadow: i < segs.length - 1 ? `1px 0 0 ${C.bg} inset` : "none",
-                        transition: "opacity .45s ease, transform .5s cubic-bezier(.2,.7,.2,1)",
-                      }} />
-                  );
-                })}
+                total time instead of appearing all at once. Grown from the group's
+                own centre outward (groupOffsetPct) while playing; once handed over,
+                either stays as the spotlight nav or gives way to the grid below. */}
+            {(playing || REPORT_END_LAYOUT === "spotlight") && (
+              <div style={{ position: "relative", height: 44, width: "82%", margin: "0 auto", display: "flex", alignItems: "center" }}>
+                <div style={{ position: "absolute", left: 0, right: 0, top: "50%", height: 2, background: C.soft, transform: "translateY(-50%)" }} />
+                <div style={{ position: "absolute", left: 0, right: 0, top: 0, height: 3,
+                  transform: `translateX(${groupOffsetPct}%)`, transition: "transform .5s cubic-bezier(.2,.7,.2,1)" }}>
+                  {segs.map((s, i) => {
+                    // once handed over, the whole day stays filled — only which segment is
+                    // focused moves; only during playback does reveal itself track idx.
+                    // during playback each segment also grows in turn, from its own centre
+                    // out to full size, layered on top of the group's own centre-outward
+                    // spread. Handing over to navigation replicates the same motion: only
+                    // the focused segment is grown, everything else collapses to its centre.
+                    const active = playing ? i <= idx : i === idx;
+                    return (
+                      <div key={s.e.id} onClick={() => !playing && setReportIdx(i)}
+                        style={{
+                          position: "absolute", left: `${s.leftPct}%`, width: `${s.wPct}%`, top: 0, height: 3, borderRadius: 1,
+                          background: C.bone, cursor: playing ? "default" : "pointer",
+                          opacity: active ? 0.9 : 0,
+                          transform: `scaleX(${active ? 1 : 0})`, transformOrigin: "center",
+                          boxShadow: i < segs.length - 1 ? `1px 0 0 ${C.bg} inset` : "none",
+                          transition: "opacity .45s ease, transform .5s cubic-bezier(.2,.7,.2,1)",
+                        }} />
+                    );
+                  })}
+                </div>
               </div>
-            </div>
+            )}
 
-            {/* dots under the bar — only once playback has handed over, showing where
-                you are and that swiping (or tapping the line/a dot) moves between days. */}
-            <div style={{ display: "flex", justifyContent: "center", gap: 7, marginTop: 14, minHeight: 8 }}>
-              {!playing && n > 1 && segs.map((s, i) => (
-                <button key={s.e.id} className="dot fade" onClick={() => setReportIdx(i)}
-                  style={{ background: i === idx ? C.bone : C.line, border: "none", cursor: "pointer" }} />
-              ))}
-            </div>
+            {/* dots under the bar — spotlight layout only, showing where you are and
+                that swiping (or tapping the line/a dot) moves between activities. */}
+            {REPORT_END_LAYOUT === "spotlight" && (
+              <div style={{ display: "flex", justifyContent: "center", gap: 7, marginTop: 14, minHeight: 8 }}>
+                {!playing && n > 1 && segs.map((s, i) => (
+                  <button key={s.e.id} className="dot fade" onClick={() => setReportIdx(i)}
+                    style={{ background: i === idx ? C.bone : C.line, border: "none", cursor: "pointer" }} />
+                ))}
+              </div>
+            )}
 
             {/* comment below the line — a short summary while playing (only when curated
-                as worth surfacing), the full comment once you can navigate freely. */}
-            <div style={{ minHeight: 60, textAlign: "center", marginTop: 20, padding: "0 10px" }}>
+                as worth surfacing); once handed over, the spotlight layout shows the
+                focused activity's full comment here, the grid layout shows it per-row. */}
+            <div style={{ minHeight: playing ? 60 : 0, textAlign: "center", marginTop: playing ? 20 : 0, padding: "0 10px" }}>
               {playing && summary && (
                 <div key={`s${idx}`} className="fade" style={{ fontFamily: "var(--serif)", fontStyle: "italic", fontWeight: 300, fontSize: 13, color: C.mut, lineHeight: 1.5 }}>
                   « {summary} »
                 </div>
               )}
-              {!playing && cur && cur.e.note && cur.e.note.trim() && (
+              {!playing && REPORT_END_LAYOUT === "spotlight" && cur && cur.e.note && cur.e.note.trim() && (
                 <div key={`f${idx}`} className="fade" style={{ fontFamily: "var(--serif)", fontStyle: "italic", fontWeight: 300, fontSize: 14, color: C.text, lineHeight: 1.55 }}>
                   « {cur.e.note.trim()} »
                 </div>
               )}
             </div>
+
+            {/* grid layout — the line "decuples": one row per activity done today,
+                stacked vertically, spread across the screen (Maxence 17/07). Each
+                row's bar keeps the exact width it had as a segment of the single line
+                (its true % share of the day) — same visual DNA, just un-stacked —
+                and fades/rises in staggered by index (.fade's own animation, delayed
+                per row) so the split reads as the line coming apart rather than a
+                list popping in all at once. Title sits above the bar, same slot/style
+                as the hero label. Tapping a row's bar toggles that activity's comment
+                open or closed (several can be open at once); rows with no comment
+                aren't clickable. */}
+            {!playing && REPORT_END_LAYOUT === "grid" && (
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-evenly", gap: 18, padding: "6px 0" }}>
+                {segs.map((s, i) => {
+                  const hasNote = s.e.note && s.e.note.trim();
+                  const isOpen = hasNote && reportExpanded.has(s.e.id);
+                  return (
+                    <div key={s.e.id} style={{ textAlign: "center" }}>
+                      <div className="fade mono" style={{ fontSize: 10, letterSpacing: ".22em", textTransform: "uppercase", color: C.faint,
+                        marginBottom: 9, animationDelay: `${i * 60}ms` }}>
+                        {s.e.actionText}
+                      </div>
+                      <div onClick={() => hasNote && toggleReportExpanded(s.e.id)}
+                        style={{ position: "relative", height: 14, display: "flex", alignItems: "center", justifyContent: "center",
+                          cursor: hasNote ? "pointer" : "default", touchAction: "manipulation" }}>
+                        <div className="fade" style={{
+                          width: `${Math.max(s.wPct, 6)}%`, height: 3, borderRadius: 1, background: C.bone,
+                          animationDelay: `${i * 60}ms` }} />
+                      </div>
+                      {hasNote && isOpen && (
+                        <div className="fade" style={{ marginTop: 9, fontFamily: "var(--serif)", fontStyle: "italic", fontWeight: 300,
+                          fontSize: 13, color: C.text, lineHeight: 1.5, padding: "0 12px" }}>
+                          « {s.e.note.trim()} »
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>
