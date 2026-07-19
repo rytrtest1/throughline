@@ -1170,7 +1170,9 @@ function Throughline() {
   const gameAreaRef = useRef(null);
   const gamePaddleRef = useRef(null);
   const gameBallRef = useRef(null);
-  const gamePaddleXRef = useRef(0.5); // 0..1 fraction of play-area width
+  const gameTargetElRef = useRef(null); // the rendered text node — its real box IS the hitbox
+  const PADDLE_W = 0.26, PADDLE_Y = 0.86, BALL_PX = 14;
+  const gamePaddleXRef = useRef(0.5); // 0..1 fraction of play-area width, centre of the paddle
   const gameBallRef2 = useRef({ x: 0.5, y: 0.6, vx: 0, vy: 0 }); // ball physics state
   const gameIdxRef = useRef(0);
   gameIdxRef.current = gameIdx;
@@ -1181,11 +1183,13 @@ function Throughline() {
     if (!el) return;
     const rect = el.getBoundingClientRect();
     if (!rect.width) return;
-    gamePaddleXRef.current = Math.max(0.08, Math.min(0.92, (clientX - rect.left) / rect.width));
+    const half = PADDLE_W / 2 + 0.02;
+    gamePaddleXRef.current = Math.max(half, Math.min(1 - half, (clientX - rect.left) / rect.width));
   };
   useEffect(() => {
     if (stage !== "game") return;
-    const PADDLE_W = 0.26, PADDLE_Y = 0.86, BALL_R_FRAC = 0.018, TARGET_Y = 0.24, TARGET_HALF_W = 0.3;
+    gamePaddleXRef.current = 0.5; // every game opens with the paddle centred
+    const BALL_R_FRAC = 0.018;
     const launch = () => {
       const ang = Math.PI * (0.28 + Math.random() * 0.44); // upward cone, never dead-flat
       gameBallRef2.current = { x: 0.5, y: 0.62, vx: Math.cos(ang) * 0.00055, vy: -Math.abs(Math.sin(ang)) * 0.00055 };
@@ -1197,40 +1201,77 @@ function Throughline() {
       const dt = lastTs ? Math.min(48, ts - lastTs) : 16;
       lastTs = ts;
       const st = gameBallRef2.current;
+      const el = gameAreaRef.current;
+      const rect = el ? el.getBoundingClientRect() : null;
       st.x += st.vx * dt;
       st.y += st.vy * dt;
       if (st.x < BALL_R_FRAC) { st.x = BALL_R_FRAC; st.vx = Math.abs(st.vx); }
       if (st.x > 1 - BALL_R_FRAC) { st.x = 1 - BALL_R_FRAC; st.vx = -Math.abs(st.vx); }
       if (st.y < BALL_R_FRAC) { st.y = BALL_R_FRAC; st.vy = Math.abs(st.vy); }
-      // paddle bounce — only while descending, so it can't re-trigger mid-bounce
+      // paddle bounce — only while descending, so it can't re-trigger mid-bounce.
+      // outgoing angle depends on WHERE it lands (Maxence 19/07: "au centre dévié
+      // normalement, à droite plus vers la droite" — classic breakout paddle-steer),
+      // not a small nudge on top of the incoming velocity — the angle is fully
+      // recomputed from hit offset so an edge hit reads as a sharp deflection.
       if (st.vy > 0 && st.y > PADDLE_Y - 0.02 && st.y < PADDLE_Y + 0.03) {
         if (Math.abs(st.x - gamePaddleXRef.current) < PADDLE_W / 2 + BALL_R_FRAC) {
-          st.vy = -Math.abs(st.vy);
-          st.vx += (st.x - gamePaddleXRef.current) * 0.0009;
+          const speed = Math.hypot(st.vx, st.vy) || 0.00055;
+          const offset = Math.max(-1, Math.min(1, (st.x - gamePaddleXRef.current) / (PADDLE_W / 2)));
+          const angle = offset * Math.PI * 0.36; // 0 at centre, up to ~65° at the edges
+          st.vx = Math.sin(angle) * speed;
+          st.vy = -Math.cos(angle) * speed;
         }
       }
       // missed the paddle entirely — no penalty, just relaunch from centre
       if (st.y > 1.05) launch();
-      // target band, armed/disarmed so a single pass through can only count once
-      const inTargetBand = Math.abs(st.y - TARGET_Y) < 0.055 && Math.abs(st.x - 0.5) < TARGET_HALF_W;
-      if (inTargetBand && hitArmed && st.vy < 0) {
-        hitArmed = false;
-        st.vy = Math.abs(st.vy);
-        const next = gameIdxRef.current + 1;
-        setGameIdx(next);
-        if (next >= gameQueueRef.current.length) {
-          alive = false;
-          setTimeout(() => resetFlow("report"), 550);
-          return;
-        }
-      } else if (!inTargetBand && st.y > TARGET_Y + 0.1) {
-        hitArmed = true;
+      // target hitbox = the text's OWN rendered box (Maxence 19/07: a fixed band
+      // missed on multi-line titles and on the sides of short ones) — measured
+      // fresh each frame since the target text/size changes with gameIdx. A little
+      // padding around the glyphs for forgiveness, not tightness.
+      let t = null;
+      const targetEl = gameTargetElRef.current;
+      if (targetEl && rect && rect.width && rect.height) {
+        const tr = targetEl.getBoundingClientRect();
+        const pad = 10;
+        t = {
+          left: (tr.left - pad - rect.left) / rect.width,
+          right: (tr.right + pad - rect.left) / rect.width,
+          top: (tr.top - pad - rect.top) / rect.height,
+          bottom: (tr.bottom + pad - rect.top) / rect.height,
+        };
       }
-      const el = gameAreaRef.current;
-      const rect = el ? el.getBoundingClientRect() : null;
+      if (t) {
+        const withinX = st.x + BALL_R_FRAC > t.left && st.x - BALL_R_FRAC < t.right;
+        const withinY = st.y + BALL_R_FRAC > t.top && st.y - BALL_R_FRAC < t.bottom;
+        if (withinX && withinY && hitArmed) {
+          hitArmed = false;
+          // classic AABB resolution: bounce off whichever edge was penetrated
+          // least — this is what makes a top hit bounce down, a bottom hit bounce
+          // up, and a side hit bounce sideways, instead of only ever "from below".
+          const overlapX = Math.min(st.x + BALL_R_FRAC - t.left, t.right - (st.x - BALL_R_FRAC));
+          const overlapY = Math.min(st.y + BALL_R_FRAC - t.top, t.bottom - (st.y - BALL_R_FRAC));
+          if (overlapX < overlapY) st.vx = -st.vx; else st.vy = -st.vy;
+          const next = gameIdxRef.current + 1;
+          setGameIdx(next);
+          if (next >= gameQueueRef.current.length) {
+            alive = false;
+            // paddle eases back to centre as the closing beat, instead of freezing
+            // wherever it was last dragged (Maxence 19/07).
+            gamePaddleXRef.current = 0.5;
+            if (gamePaddleRef.current && rect) {
+              gamePaddleRef.current.style.transition = "left .5s cubic-bezier(.2,.7,.2,1)";
+              gamePaddleRef.current.style.left = `${0.5 * rect.width - (PADDLE_W * rect.width) / 2}px`;
+            }
+            setTimeout(() => resetFlow("report"), 550);
+            return;
+          }
+        } else if (!(withinX && withinY)) {
+          hitArmed = true;
+        }
+      }
       if (rect && rect.width && rect.height) {
         if (gameBallRef.current) gameBallRef.current.style.transform =
-          `translate(${st.x * rect.width - BALL_R_FRAC * rect.width}px, ${st.y * rect.height - BALL_R_FRAC * rect.width}px)`;
+          `translate(${st.x * rect.width - BALL_PX / 2}px, ${st.y * rect.height - BALL_PX / 2}px)`;
         if (gamePaddleRef.current) gamePaddleRef.current.style.left =
           `${gamePaddleXRef.current * rect.width - (PADDLE_W * rect.width) / 2}px`;
       }
@@ -2676,12 +2717,16 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
           onContextMenu={(e) => e.preventDefault()}
           style={{ position: "relative", width: "100%", height: "100vh", overflow: "hidden", touchAction: "none", userSelect: "none", WebkitUserSelect: "none" }}>
           {/* one target at a time, centre screen — never a grid (un doigt, une
-              ligne, jamais de liste applies here too, Maxence 19/07) */}
+              ligne, jamais de liste applies here too, Maxence 19/07). The outer
+              div only centres and caps the wrap width; the inner span is what
+              gets measured for the hitbox, so it hugs the text's real box exactly
+              — including every wrapped line on a longer title, not just the first. */}
           {cur && (
-            <div key={cur.id} className="fade mono" style={{
-              position: "absolute", top: "24%", left: 0, right: 0, textAlign: "center",
-              fontSize: 11, letterSpacing: ".08em", color: C.bone, padding: "0 12%" }}>
-              {cur.text}
+            <div style={{ position: "absolute", top: "24%", left: 0, right: 0, textAlign: "center", padding: "0 14%" }}>
+              <span ref={gameTargetElRef} key={cur.id} className="fade mono" style={{
+                display: "inline-block", fontSize: 11, letterSpacing: ".08em", color: C.bone }}>
+                {cur.text}
+              </span>
             </div>
           )}
           {/* ball */}
