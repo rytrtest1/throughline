@@ -1300,7 +1300,7 @@ function Throughline() {
   // hold-to-skip line elsewhere (Maxence 19/07 — shake now opens the hidden game
   // instead, see devicemotion listener). A real drag (exploring segments) cancels
   // the pending close, same movement-cancels-hold pattern as onLineDown/onLineMove.
-  const REPORT_HOLD_MS = 700;
+  const REPORT_HOLD_MS = 2000; // Maxence 19/07: 700ms fired too easily mid-explore, deconcentrating normal navigation
   const [reportHolding, setReportHolding] = useState(false);
   const reportHoldTimer = useRef(null);
   const reportHoldStartX = useRef(0);
@@ -1765,14 +1765,12 @@ function Throughline() {
     const t = e.changedTouches[0]; const dx = t.clientX - s.x, dy = t.clientY - s.y;
     if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) advanceAlbumTitle(dx < 0 ? 1 : -1);
   };
-  // rapport: a day-close screen, unlocked only by naming it — typing "rapport" once
-  // the day's click count clears the bar (Maxence 14/07, tested as a mockup first).
-  // Reachable two ways: the after-session comment (here) and the free-log box
-  // (submitFreeLog below) — same gate, same stage, no separate mechanism.
+  // rapport: a day-close screen, gated on the day's click count. Used to be
+  // unlocked only by typing "rapport" by hand (14/07) — replaced (Maxence 19/07)
+  // by a button that appears on its own once the threshold clears, see the entry
+  // screen's footer button below. finishFlow no longer inspects the comment text.
   const RAPPORT_MIN_CLICS = 10;
   const finishFlow = (text) => {
-    const clicksToday = log.filter((e) => e.date === todayKey() && isClick(e)).length;
-    const rapport = clicksToday >= RAPPORT_MIN_CLICS && !!text && text.trim().toLowerCase().includes("rapport");
     // showDoneHint was only ever re-checked against storage at app launch — it
     // stayed true for every activity within one continuous session, so "ton mot
     // nourrit…" kept reappearing after the first finish instead of leaving for
@@ -1780,7 +1778,7 @@ function Throughline() {
     // is leaving — NOT in start(), which also fires before the very first done
     // screen and would have wiped it before it ever rendered once (caught testing).
     setShowDoneHint(false);
-    resetFlow(rapport ? "report" : "entry");
+    resetFlow("entry");
   };
 
   // ----- after-session comment → advance the pipeline piece via a direct Claude call -----
@@ -2342,9 +2340,10 @@ Commentaire laissé après la session :
   // free-text log for anything done outside the app — one field, one Claude call
   // resolves the intent instead of forcing every line into an activity match.
   // Replaces the old per-activity quick-log buttons (removed with the progress tab).
-  // Three intents (Maxence 14/07 — the original version always forced "activity",
-  // even when nothing in the catalogue actually matched):
-  //   "rapport" — same door as the after-session comment, see finishFlow.
+  // Two intents (Maxence 14/07 — the original version always forced "activity",
+  // even when nothing in the catalogue actually matched; the "rapport" intent that
+  // used to live here moved to its own footer button, 19/07 — see the entry
+  // screen's rapport button, above where showTapHint renders):
   //   "activity" — logged exactly as before, a real "done" entry feeding the engine.
   //   "note" — anything else, kept as-is (type: "note", no activityId) rather than
   //   mis-matched to the nearest activity. Never counts toward "clics" (isClick).
@@ -2353,13 +2352,8 @@ Commentaire laissé après la session :
     if (!text) return;
     const key = (await store.get("tlx_apiKey")) || "";
     if (!key) {
-      // no key: can't classify freely, but the "rapport" keyword alone still works
-      // (same plain match as finishFlow) — everything else is kept as a note rather
-      // than silently dropped or force-matched without any real reading of the text.
-      const clicksToday = log.filter((e) => e.date === todayKey() && isClick(e)).length;
-      if (clicksToday >= RAPPORT_MIN_CLICS && text.toLowerCase().includes("rapport")) {
-        setLogText(""); setLogOpen(false); setStage("report"); return;
-      }
+      // no key: can't classify freely, kept as a note rather than silently dropped
+      // or force-matched without any real reading of the text.
       setLog((L) => [...L, { id: uid(), date: todayKey(), ts: realNow().getTime(), type: "note", note: text }]);
       setMsg("noté — pas de clé API pour lire plus finement"); setLogText(""); setLogOpen(false);
       setTimeout(() => setMsg(""), 2400);
@@ -2379,7 +2373,6 @@ Ce qu'il a tapé :
 « ${text} »
 
 Détermine intent :
-- "rapport" si le texte demande un bilan/rapport de sa journée (le mot "rapport" ou un équivalent explicite).
 - "activity" si le texte décrit clairement une activité qu'il vient de faire ET qui correspond à une ligne précise du catalogue.
 - "note" pour tout le reste — une pensée, un fait à garder, quelque chose de flou ou qui ne colle à aucune activité précise. Ne force JAMAIS un match approximatif : dans le doute, "note".
 
@@ -2389,7 +2382,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
       const out = await claudeJSON(key, prompt, {
         type: "object",
         properties: {
-          intent: { type: "string", enum: ["rapport", "activity", "note"] },
+          intent: { type: "string", enum: ["activity", "note"] },
           // structured-outputs strict mode requires every property in `required` —
           // nullable type + explicit null is how an LLM field stays optional under that
           // constraint. Omitting these from `required` was producing the http 400 on
@@ -2401,14 +2394,6 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
         required: ["intent", "activity_id", "action_id", "min", "note"],
         additionalProperties: false,
       }, 300);
-
-      if (out.intent === "rapport") {
-        const clicksToday = log.filter((e) => e.date === todayKey() && isClick(e)).length;
-        if (clicksToday >= RAPPORT_MIN_CLICS) setStage("report");
-        else setMsg(`pas encore ${RAPPORT_MIN_CLICS} clics aujourd'hui (${clicksToday})`);
-        setLogText(""); setLogOpen(false);
-        return;
-      }
 
       const a = out.intent === "activity" ? activities.find((x) => x.id === out.activity_id) : null;
       if (a) {
@@ -2684,7 +2669,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
   });
 
   if (loading) return (
-    <div className="tl"><style dangerouslySetInnerHTML={{ __html: css }} /><div className="grain" /><div className="wrap"><span className="lab">loading…</span></div></div>
+    <div className="tl" key="loading"><style dangerouslySetInnerHTML={{ __html: css }} /><div className="grain" /><div className="wrap"><span className="lab">loading…</span></div></div>
   );
 
   // interactive layout once playback has run through: "trace" (default, Maxence
@@ -2709,7 +2694,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
     const onGameDown = (e) => onGamePaddleMove(e.clientX ?? (e.touches && e.touches[0].clientX));
     const onGameMove = (e) => onGamePaddleMove(e.clientX ?? (e.touches && e.touches[0].clientX));
     return (
-      <div className="tl">
+      <div className="tl" key="game">
         <style dangerouslySetInnerHTML={{ __html: css }} />
         <div className="grain" />
         <div ref={gameAreaRef}
@@ -2816,7 +2801,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
     const heroSeg = REPORT_END_LAYOUT === "trace" ? (playing ? cur : traceSeg) : cur;
 
     return (
-      <div className="tl">
+      <div className="tl" key="report">
         <style dangerouslySetInnerHTML={{ __html: css }} />
         <div className="grain" />
         <div className="wrap" style={{ minHeight: "100vh", padding: "40px 20px", display: "flex", flexDirection: "column" }}
@@ -2987,7 +2972,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
   const frac = (stage === "running" || stage === "done") ? elapsedMs / fullMs : 0;
 
   return (
-    <div className="tl">
+    <div className="tl" key="main">
       <style dangerouslySetInnerHTML={{ __html: css }} />
       <div className="grain" />
       <div className="wrap" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
@@ -3179,6 +3164,19 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
                 {stage === "entry" && showTapHint && (
                   <div className="fade mono" style={{ fontSize: 10, letterSpacing: ".14em", textTransform: "uppercase", color: C.faint }}>
                     tape pour commencer
+                  </div>
+                )}
+
+                {/* rapport button — unlocks itself once today's objective is reached,
+                    replacing the old "type rapport to open it" discovery mechanic
+                    (Maxence 19/07: a button is more direct than typing a keyword by
+                    hand). Pinned to the true bottom of the screen, not just under the
+                    line, so it reads as its own footer rather than part of the entry
+                    hint above it. Absent entirely below the click threshold — no
+                    disabled/greyed state, matches "ne pas ajouter par défaut". */}
+                {stage === "entry" && log.filter((e) => e.date === todayKey() && isClick(e)).length >= RAPPORT_MIN_CLICS && (
+                  <div className="fade" style={{ position: "fixed", left: 0, right: 0, bottom: 28, textAlign: "center" }}>
+                    <button className="link" onClick={() => setStage("report")}>rapport</button>
                   </div>
                 )}
 
