@@ -1754,6 +1754,8 @@ function Throughline() {
   const isAlbumActivity = !!(current && current.activity.id === "a_ecoute_album");
   const albumLineRef = useRef(null);
   const albumDragging = useRef(false);
+  const albumDownX = useRef(0);
+  const albumDragged = useRef(false); // same tap-vs-drag read as the hero line (see onLineDown/onLineMove)
   const albumTouchRef = useRef(null);
   // dragging the mini line sets the CURRENT slot's rating — magnitude from centre,
   // same read as the hero line's own centre-out fill (see setAlbumRatingFromPointer).
@@ -1765,9 +1767,17 @@ function Throughline() {
     const rating = Math.round(Math.max(0, Math.min(1, Math.abs(clientX - (rect.left + half)) / half)) * 100);
     setAlbumTitles((arr) => arr.map((t, i) => (i === albumIdx ? { ...t, rating } : t)));
   };
-  const onAlbumLineDown = (e) => { albumDragging.current = true; e.currentTarget.setPointerCapture(e.pointerId); setAlbumRatingFromPointer(e.clientX); };
-  const onAlbumLineMove = (e) => { if (albumDragging.current) setAlbumRatingFromPointer(e.clientX); };
-  const onAlbumLineUp = () => { albumDragging.current = false; };
+  // no setAlbumRatingFromPointer on pointer-down (Maxence 20/07, same fix as the hero
+  // line): a plain tap here used to jump the rating to wherever it landed, which is
+  // exactly the gesture someone reaches for after already dragging — only real travel
+  // past the 8px threshold now moves the value; a tap that never moves is a no-op.
+  const onAlbumLineDown = (e) => { albumDragging.current = true; albumDragged.current = false; albumDownX.current = e.clientX; e.currentTarget.setPointerCapture(e.pointerId); };
+  const onAlbumLineMove = (e) => {
+    if (!albumDragging.current) return;
+    if (!albumDragged.current && e.clientX != null && Math.abs(e.clientX - albumDownX.current) > 8) albumDragged.current = true;
+    if (albumDragged.current) setAlbumRatingFromPointer(e.clientX);
+  };
+  const onAlbumLineUp = () => { albumDragging.current = false; albumDragged.current = false; };
   // swipe right (or a dot tap, wired at render time) moves between titles. Advancing
   // past the last slot only opens a fresh one once the current one has real text —
   // an empty slot has nothing to commit yet, swiping right from it does nothing.
@@ -3260,9 +3270,10 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
                           style={{ fontFamily: "var(--mono)", fontSize: 13, fontWeight: 400, lineHeight: 1.55, letterSpacing: ".02em", textTransform: "lowercase",
                             textAlign: "center", maxWidth: 360, margin: "0 auto", display: "block",
                             fontStyle: curTitle.text ? "normal" : "italic", color: curTitle.text ? C.text : C.faint }} />
-                        {/* the slider itself — dragging/tapping it sets the rating directly (see
-                            setAlbumRatingFromPointer), it never advances on its own. Same centre-out
-                            fill language as the hero line, half its width, thinner track and fill. */}
+                        {/* the slider itself — dragging it sets the rating, it never advances on
+                            its own. Same centre-out fill language as the hero line, half its
+                            width, thinner track and fill. Number readout dropped (Maxence 20/07,
+                            same call as the hero line) — the fill position is legible on its own. */}
                         <div ref={albumLineRef} onPointerDown={onAlbumLineDown} onPointerMove={onAlbumLineMove} onPointerUp={onAlbumLineUp} onPointerCancel={onAlbumLineUp}
                           onContextMenu={(e) => e.preventDefault()}
                           style={{ position: "relative", height: 16, width: "55%", margin: "10px auto 0", display: "flex", justifyContent: "center", alignItems: "center", cursor: "pointer", touchAction: "none", userSelect: "none" }}>
@@ -3271,9 +3282,6 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
                             <div style={{ position: "relative", height: 2, width: `${curFrac * 100}%`, background: C.bone, opacity: 0.9 }} />
                           )}
                         </div>
-                        {/* the number itself — the bar alone never confirmed what got set
-                            (Maxence 17/07). Same faint mono register as everywhere else. */}
-                        <div className="mono" style={{ fontSize: 10, color: C.faint, marginTop: 6, letterSpacing: ".04em" }}>{curTitle.rating}</div>
                         {albumTitles.length > 1 && (
                           <div style={{ display: "flex", justifyContent: "center", gap: 6, marginTop: 10 }}>
                             {albumTitles.map((t, i) => (
