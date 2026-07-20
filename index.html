@@ -1194,7 +1194,7 @@ function Throughline() {
   const gamePaddleRef = useRef(null);
   const gameBallRef = useRef(null);
   const gameTargetElRef = useRef(null); // the rendered text node — its real box IS the hitbox
-  const PADDLE_W = 0.26, PADDLE_Y = 0.86, BALL_PX = 14;
+  const PADDLE_W = 0.26, PADDLE_Y = 0.86, BALL_PX = 10;
   const gamePaddleXRef = useRef(0.5); // 0..1 fraction of play-area width, centre of the paddle
   const gameBallRef2 = useRef({ x: 0.5, y: 0.6, vx: 0, vy: 0 }); // ball physics state
   const gameIdxRef = useRef(0);
@@ -1627,7 +1627,13 @@ function Throughline() {
       // "report" excluded on purpose: it's a read-only takeover (shake to leave),
       // not an interrupted session worth resuming — reopening the app should land
       // on the normal screen, not dump you back into the rapport view (17/07).
-      if (fl && fl.date === todayKey() && fl.stage && fl.stage !== "entry" && fl.stage !== "empty" && fl.stage !== "report") {
+      // "game" excluded too (Maxence 20/07 — found by testing): gameQueue/gameIdx
+      // are plain React state, never persisted, so resuming stage "game" alone
+      // reopened the easter egg with an empty queue — no target could ever spawn,
+      // so the only coded exit (clearing the last target) could never fire. A dead
+      // end with zero UI to get back out of, reachable any time the tab reloads
+      // mid-game (a SW update, the phone backgrounding and killing the tab…).
+      if (fl && fl.date === todayKey() && fl.stage && fl.stage !== "entry" && fl.stage !== "empty" && fl.stage !== "report" && fl.stage !== "game") {
         setStage(fl.stage); setCurrent(fl.current || null);
         setStartedAt(fl.startedAt || 0); setElapsedMs(fl.startedAt ? Date.now() - fl.startedAt : 0);
         setRunning(!!fl.running); setPaused(!!fl.paused);
@@ -2766,13 +2772,16 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
               </span>
             </div>
           )}
-          {/* ball */}
+          {/* ball — sized and lit to match the line's own restraint, not a separate
+              game-y object (Maxence 20/07: the old 14px + full-strength glow read
+              as cheap against everything else here). */}
           <div ref={gameBallRef} style={{
-            position: "absolute", top: 0, left: 0, width: 14, height: 14, borderRadius: "50%",
-            background: C.bone, boxShadow: `0 0 10px ${C.bone}` }} />
-          {/* paddle — same visual language as the hero line elsewhere */}
+            position: "absolute", top: 0, left: 0, width: BALL_PX, height: BALL_PX, borderRadius: "50%",
+            background: C.bone, boxShadow: `0 0 5px rgba(214,207,191,0.55)` }} />
+          {/* paddle — same thickness as the line everywhere else (2px), not its own
+              scale (Maxence 20/07) */}
           <div ref={gamePaddleRef} style={{
-            position: "absolute", top: "86%", width: "26%", height: 4, background: C.bone, opacity: 0.9 }} />
+            position: "absolute", top: "86%", width: "26%", height: 2, background: C.bone, opacity: 0.9 }} />
         </div>
       </div>
     );
@@ -2893,7 +2902,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
                 display: "flex", justifyContent: "center", alignItems: "center" }}>
                 <div style={{ position: "absolute", left: 0, right: 0, top: "50%", height: 2, background: C.soft, transform: "translateY(-50%)" }} />
                 {reportFillPct > 0 && (
-                  <div style={{ position: "relative", flexShrink: 0, height: 6, width: `${reportFillPct}%`,
+                  <div style={{ position: "relative", flexShrink: 0, height: 2, width: `${reportFillPct}%`,
                     background: C.bone, opacity: 0.9, transition: "width .5s cubic-bezier(.2,.7,.2,1)" }} />
                 )}
               </div>
