@@ -996,6 +996,17 @@ function Throughline() {
     else { pauseStartRef.current = Date.now(); setPaused(true); }
   };
 
+  // declared up here (not down with the rest of the ambient/idle-timer logic
+  // below) because the media session effect right below needs both — a
+  // dependency array is evaluated at the useEffect() call site itself, during
+  // the same synchronous render pass, so referencing a not-yet-declared const
+  // there is a real TDZ error, unlike a closure that only reads it on a later,
+  // async invocation (found the hard way: "Cannot access 'ambient' before
+  // initialization").
+  const [ambient, setAmbient] = useState(false);
+  const stageRef = useRef(stage); // read fresh inside listeners below (media session, devicemotion, idle timer) — avoids stale closures
+  stageRef.current = stage;
+
   // "ligne présence" scoped down to what a PWA can actually do (Maxence 19/07):
   // a real, near-silent, looping audio keeps a genuine OS Media Session alive, so
   // the lock screen/notification shade gets real play/pause controls while a
@@ -1026,33 +1037,44 @@ function Throughline() {
   }, []);
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
-    const active = stage === "running";
+    // extended 24/07 (Maxence: "et le always on display?") — the real AOD is
+    // still out of reach (no API lets a web app draw on it), but this media
+    // session trick is the one lever that DOES reach it, so widen its window to
+    // match: alive during a running session (as before) OR whenever ambient is
+    // showing (idle 30s+), not just during a session. Idle has no real activity
+    // to name, so metadata falls back to plain "BALANCE" and playbackState reads
+    // "paused" (nothing actually happening) rather than "playing".
+    const runningActive = stage === "running";
+    const active = runningActive || ambient;
     const el = silentAudioRef.current;
-    if (active && !paused) {
+    if (runningActive && !paused) {
       silentCtxRef.current?.resume?.()?.catch(() => {});
       el?.play()?.catch(() => {});
       try { navigator.mediaSession.playbackState = "playing"; } catch (e) {}
-    } else if (active && paused) {
-      el?.pause?.();
+    } else if (active) {
+      silentCtxRef.current?.resume?.()?.catch(() => {});
+      el?.play()?.catch(() => {});
       try { navigator.mediaSession.playbackState = "paused"; } catch (e) {}
     } else {
       el?.pause?.();
       try { navigator.mediaSession.playbackState = "none"; navigator.mediaSession.metadata = null; } catch (e) {}
     }
-    if (active && current && typeof MediaMetadata !== "undefined") {
+    if (active && typeof MediaMetadata !== "undefined") {
       try {
         navigator.mediaSession.metadata = new MediaMetadata({
-          title: (current.action && current.action.text) || "BALANCE",
-          artist: (current.activity && current.activity.name) || "BALANCE",
+          title: (runningActive && current?.action?.text) || "BALANCE",
+          artist: (runningActive && current?.activity?.name) || "",
         });
       } catch (e) {}
     }
-  }, [stage, paused, current]);
+  }, [stage, paused, current, ambient]);
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
+    // play/pause only meaningful mid-session — a tap while merely ambient/idle
+    // (no real timer running) is a no-op rather than corrupting session state.
     try {
-      navigator.mediaSession.setActionHandler("play", () => { if (paused) togglePause(); });
-      navigator.mediaSession.setActionHandler("pause", () => { if (!paused) togglePause(); });
+      navigator.mediaSession.setActionHandler("play", () => { if (stageRef.current === "running" && paused) togglePause(); });
+      navigator.mediaSession.setActionHandler("pause", () => { if (stageRef.current === "running" && !paused) togglePause(); });
     } catch (e) {}
     return () => {
       try {
@@ -1373,13 +1395,12 @@ function Throughline() {
   // ambiant pendant une action aussi, juste le texte disparaît, la ligne balance
   // toujours"). This also gets the "exact same size" requirement for free — it's
   // literally the same DOM node, not a lookalike. Any touch anywhere dismisses it.
-  const [ambient, setAmbient] = useState(false);
+  // (`ambient` and `stageRef` themselves are declared earlier, near togglePause —
+  // the media session effect above needs them too.)
   const idleTimerRef = useRef(null);
   const AMBIENT_IDLE_MS = 30000;
   const AMBIENT_FADE_OUT_MS = 900; // settling into ambient — slow, matches the calm/screensaver feel
   const AMBIENT_FADE_IN_MS = 150; // waking up — near-instant, no lag between touch and response
-  const stageRef = useRef(stage); // read fresh inside the devicemotion listener below — avoids stale closures
-  stageRef.current = stage;
   // LINE_MODE "tilt": the session's domain-imbalance reading, frozen once at
   // begin() (same domainBalance() the shake uses) — not recomputed per frame so
   // the sway doesn't jitter as the log changes mid-session. ampDeg/periodMs are
