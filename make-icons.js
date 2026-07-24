@@ -3,7 +3,7 @@
 const zlib = require("zlib");
 const fs = require("fs");
 
-const BG = [0x0a, 0x0a, 0x0b];
+const BG = [0x00, 0x00, 0x00];
 const LINE = [0xd6, 0xcf, 0xbf];
 
 function crc32(buf) {

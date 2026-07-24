@@ -926,7 +926,6 @@ const css = `
 *{box-sizing:border-box}
 .tl,.tl *{-webkit-tap-highlight-color:transparent}
 .tl{--serif:'Spectral',Georgia,serif;--mono:'IBM Plex Mono',ui-monospace,Menlo,monospace;background:${C.bg};color:${C.text};min-height:100vh;font-family:var(--serif);position:relative;overflow-x:hidden}
-.grain{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.05;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 .wrap{position:relative;z-index:1;max-width:600px;margin:0 auto;padding:26px 20px 90px}
 .lab{font-family:var(--mono);font-size:10px;letter-spacing:.22em;text-transform:uppercase;color:${C.faint}}
 .mono{font-family:var(--mono)}
@@ -2751,7 +2750,7 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
   });
 
   if (loading) return (
-    <div className="tl" key="loading"><style dangerouslySetInnerHTML={{ __html: css }} /><div className="grain" /><div className="wrap"><span className="lab">loading…</span></div></div>
+    <div className="tl" key="loading"><style dangerouslySetInnerHTML={{ __html: css }} /><div className="wrap"><span className="lab">loading…</span></div></div>
   );
 
   // interactive layout once playback has run through: "trace" (default, Maxence
@@ -2778,7 +2777,6 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
     return (
       <div className="tl" key="game">
         <style dangerouslySetInnerHTML={{ __html: css }} />
-        <div className="grain" />
         <div ref={gameAreaRef}
           onPointerDown={onGameDown} onPointerMove={onGameMove} onTouchStart={onGameDown} onTouchMove={onGameMove}
           onContextMenu={(e) => e.preventDefault()}
@@ -2888,7 +2886,6 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
     return (
       <div className="tl" key="report">
         <style dangerouslySetInnerHTML={{ __html: css }} />
-        <div className="grain" />
         <div className="wrap" style={{ minHeight: "100vh", padding: "40px 20px", display: "flex", flexDirection: "column" }}
           onTouchStart={onReportTouchStart} onTouchEnd={onReportTouchEnd}>
           <div style={{ textAlign: "center", marginBottom: 40 }}>
@@ -3059,11 +3056,6 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
   return (
     <div className="tl" key="main">
       <style dangerouslySetInnerHTML={{ __html: css }} />
-      {/* grain texture is a deliberate filmic touch everywhere else, but its noise
-          pixels are never truly rgb(0,0,0) — exactly what ambient is trying to
-          avoid for OLED (Maxence 24/07: "je veux du noir pur pour oled"). Dropped
-          only while ambient is active; every other screen keeps it unchanged. */}
-      {!ambient && <div className="grain" />}
       <div className="wrap" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
 
 
