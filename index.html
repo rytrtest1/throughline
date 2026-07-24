@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>BALANCE</title>
 <link rel="manifest" href="manifest.json" />
-<meta name="theme-color" content="#0a0a0b" />
+<meta name="theme-color" content="#000000" />
 <meta name="mobile-web-app-capable" content="yes" />
 <link rel="icon" href="icon-192.png" />
 <link rel="apple-touch-icon" href="icon-192.png" />
-<style>html,body{margin:0;background:#0a0a0b}</style>
+<style>html,body{margin:0;background:#000}</style>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
@@ -920,7 +920,7 @@ Réponds avec un titre court (nom de l'œuvre, du plat, du morceau…) et un sou
 }
 
 // ---------- palette / css ----------
-const C = { bg: "#0a0a0b", text: "#ece9e3", mut: "#8a877f", faint: "#56544e", line: "#222226", soft: "#18181b", bone: "#d6cfbf" };
+const C = { bg: "#000000", text: "#ece9e3", mut: "#8a877f", faint: "#56544e", line: "#222226", soft: "#18181b", bone: "#d6cfbf" };
 const css = `
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=Spectral:ital,wght@0,300;0,400;0,500;1,300;1,400&display=swap');
 *{box-sizing:border-box}
@@ -1363,6 +1363,24 @@ function Throughline() {
   const revealActiveRef = useRef(false);
   const lineRef = useRef(null); // the swaying div — tilt is driven on it directly, not through React state
   const rafRef = useRef(null);
+  // ambient screensaver (Maxence 24/07, option 1 of the "off display" idea — the
+  // real OS lock screen/AOD is out of reach from a web app, this is the part that
+  // IS reachable). After AMBIENT_IDLE_MS of no touch anywhere, `ambient` flips on
+  // regardless of stage — background is already true #000 everywhere (see C.bg),
+  // so no separate screen is needed: the "now" tab's own render (below) just
+  // hides the text-above/controls-below blocks when ambient is true and leaves
+  // the line itself completely untouched — flat at rest, or its normal live tilt
+  // if a session happens to be running (Maxence: "l'app passe bien en mode
+  // ambiant pendant une action aussi, juste le texte disparaît, la ligne balance
+  // toujours"). This also gets the "exact same size" requirement for free — it's
+  // literally the same DOM node, not a lookalike. Any touch anywhere dismisses it.
+  const [ambient, setAmbient] = useState(false);
+  const idleTimerRef = useRef(null);
+  const AMBIENT_IDLE_MS = 30000;
+  const AMBIENT_FADE_OUT_MS = 900; // settling into ambient — slow, matches the calm/screensaver feel
+  const AMBIENT_FADE_IN_MS = 150; // waking up — near-instant, no lag between touch and response
+  const stageRef = useRef(stage); // read fresh inside the devicemotion listener below — avoids stale closures
+  stageRef.current = stage;
   // LINE_MODE "tilt": the session's domain-imbalance reading, frozen once at
   // begin() (same domainBalance() the shake uses) — not recomputed per frame so
   // the sway doesn't jitter as the log changes mid-session. ampDeg/periodMs are
@@ -1436,6 +1454,36 @@ function Throughline() {
 
   useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
 
+  // idle → ambient: any touch/click/key anywhere resets the clock; go quiet after
+  // AMBIENT_IDLE_MS of true silence — regardless of stage (Maxence 24/07: "l'app
+  // passe bien en mode ambiant pendant une action aussi, juste le texte
+  // disparaît, la ligne balance toujours" — during a running session this just
+  // hides the text/controls below; the line itself, rendered separately, keeps
+  // doing its own thing untouched, live tilt included). Listening on window
+  // (capture) rather than just the wrap's own handlers so it also catches a tap
+  // that lands anywhere while ambient is active. Mounted once (empty deps) and
+  // reads `ambient` through a ref, not the state directly — depending on
+  // `ambient` here would re-run this effect the instant ambient flips true, and
+  // rearm()'s own "if ambient, dismiss it" line would then fire against its OWN
+  // just-set value and immediately undo it.
+  const ambientRef = useRef(false);
+  useEffect(() => { ambientRef.current = ambient; }, [ambient]);
+  useEffect(() => {
+    const rearm = () => {
+      if (ambientRef.current) setAmbient(false);
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = setTimeout(() => setAmbient(true), AMBIENT_IDLE_MS);
+    };
+    rearm();
+    window.addEventListener("pointerdown", rearm, true);
+    window.addEventListener("keydown", rearm, true);
+    return () => {
+      clearTimeout(idleTimerRef.current);
+      window.removeEventListener("pointerdown", rearm, true);
+      window.removeEventListener("keydown", rearm, true);
+    };
+  }, []);
+
   // the devicemotion listener below is registered once (empty deps) so it isn't
   // torn down/re-added on every render, but that means its closure would otherwise
   // freeze startBalanceReveal (and the activities/log it reads) at mount time —
@@ -1444,8 +1492,6 @@ function Throughline() {
   // render keeps it current without re-subscribing the listener.
   const startBalanceRevealRef = useRef(() => {});
   startBalanceRevealRef.current = startBalanceReveal;
-  const stageRef = useRef(stage); // same stale-closure reason — read fresh inside the listener below
-  stageRef.current = stage;
 
   useEffect(() => {
     if (typeof window === "undefined" || !window.DeviceMotionEvent) return;
@@ -3065,7 +3111,14 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
             <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", paddingBottom: 30 }}>
 
               {/* ---------- above the line: the instruction ---------- */}
-              <div style={{ minHeight: 130, display: "flex", flexDirection: "column", justifyContent: "flex-end", textAlign: "center", marginBottom: 30 }}>
+              {/* ambient (Maxence 24/07): stays mounted, just fades via opacity — slow
+                  out settling into ambient, quick back in on waking (same asymmetric-
+                  duration idiom as the "done" vs "running" tilt transition elsewhere).
+                  pointerEvents off while faded so a stray tap can't land on a hidden
+                  button instead of just waking the screen. */}
+              <div style={{ minHeight: 130, display: "flex", flexDirection: "column", justifyContent: "flex-end", textAlign: "center", marginBottom: 30,
+                opacity: ambient ? 0 : 1, pointerEvents: ambient ? "none" : "auto",
+                transition: `opacity ${ambient ? AMBIENT_FADE_OUT_MS : AMBIENT_FADE_IN_MS}ms ease` }}>
 
                 {(stage === "proposal" || stage === "running" || stage === "done") && current && (
                   <div className="fade">
@@ -3166,11 +3219,22 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
                       // tick…) would otherwise reapply this branch mid-reveal and stomp the
                       // loop's own writes, which read as the reveal randomly decelerating
                       // partway through (Maxence 16/07, round 4).
+                      // Reverted 24/07 back to resting-static-unless-shaken (Maxence: the
+                      // permanent sway wasn't what he meant by "toujours" — only wanted the
+                      // reading to be live/un-frozen, not the line always visibly moving at
+                      // rest; the shake still exists specifically to nudge toward action by
+                      // showing clicks-remaining, see startBalanceReveal).
                       ...(LINE_MODE === "tilt" && !ratingActive && !revealActiveRef.current ? { transform: `rotate(${tiltDeg}deg)`,
                         transition: stage === "done" ? "transform .7s cubic-bezier(.2,.7,.2,1)" : "transform .1s linear" } : {}) }}>
-                    {/* hollow track — inset, never touches the edges */}
-                    <div className={stage === "entry" && !holding ? "breathe" : ""}
-                      style={{ position: "absolute", left: 0, right: 0, top: "50%", height: 2, background: stage === "entry" ? C.bone : C.soft,
+                    {/* hollow track — inset, never touches the edges. Breathes on entry
+                        (always was) AND whenever ambient is active (Maxence 24/07: "le
+                        breathe veut dire 'touche-moi'" — the invitation should show up
+                        whichever stage ambient caught the app in, not just entry), bone-
+                        colored in both cases so the pulse is actually visible instead of
+                        the dim C.soft an ambient running/done/proposal line would
+                        otherwise keep. */}
+                    <div className={(stage === "entry" || ambient) && !holding ? "breathe" : ""}
+                      style={{ position: "absolute", left: 0, right: 0, top: "50%", height: 2, background: (stage === "entry" || ambient) ? C.bone : C.soft,
                         transform: `translateY(-50%) scaleX(${holding ? 0 : 1})`, transformOrigin: "center", transition: trackTransition }} />
                     {/* centre fill — grows symmetrically from the middle, overshoots the track when you go beyond.
                         LINE_MODE "tilt" skips this entirely: the tilt on the wrapper above is the only signal. */}
@@ -3197,7 +3261,11 @@ note = dans tous les cas, une ligne qui résume ce qui a été dit (sert de comm
               })()}
 
               {/* ---------- below the line: controls ---------- */}
-              <div style={{ minHeight: 130, marginTop: 30, textAlign: "center" }}>
+              {/* ambient: fades (slow out, quick back in) rather than unmounting — same
+                  reasoning as the block above the line. */}
+              <div style={{ minHeight: 130, marginTop: 30, textAlign: "center",
+                opacity: ambient ? 0 : 1, pointerEvents: ambient ? "none" : "auto",
+                transition: `opacity ${ambient ? AMBIENT_FADE_OUT_MS : AMBIENT_FADE_IN_MS}ms ease` }}>
 
                 {/* entry: nothing, except the one-time first-launch hint. */}
                 {stage === "entry" && showTapHint && (
